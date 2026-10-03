@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import urllib.error
@@ -17,7 +20,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import yaml
 
@@ -34,7 +37,14 @@ from mb.durable import atomic_write_text
 CONFIG_RELATIVE_PATH = Path(".mb") / "connect.yaml"
 USER_SCOPE_RELATIVE_PATH = Path("connect") / "user-scope.yaml"
 SENSITIVE_KEY_PARTS = ("token", "secret", "password", "credential", "api_key", "apikey", "key")
-SAFE_METADATA_KEYS = {"token_type", "token_scope", "api_token_type"}
+SAFE_METADATA_KEYS = {
+    "token_type",
+    "token_scope",
+    "api_token_type",
+    "key_name",
+    "onepassword_item",
+    "source",
+}
 CONNECT_SCOPES = {"repo", "user"}
 VALIDATION_TIMEOUT_SECONDS = 8
 SECRET_REPLACEMENT = "<redacted>"
@@ -66,7 +76,26 @@ UNVERIFIED_STATE = "stored_unverified"
 # probe can be verified by running `mb connect test`, and one without cannot be
 # verified by anything the operator runs.
 # `test_probe_provider_set_matches_validate_with_provider` guards the drift.
-PROBE_PROVIDERS: frozenset[str] = frozenset({"cloudflare", "apify", "meta"})
+PROBE_PROVIDERS: frozenset[str] = frozenset(
+    {"cloudflare", "apify", "meta", "stripe", "github", "ga4"}
+)
+
+
+class ConnectRefusal(ValueError):
+    """A connect policy refused an action. ``rule`` names the policy, never a value."""
+
+    def __init__(self, rule: str, message: str) -> None:
+        super().__init__(message)
+        self.rule = rule
+
+
+def _refuse(rule: str, message: str) -> NoReturn:
+    """Raise every connect refusal from one place.
+
+    ``rule`` is a stable machine name for the policy that fired; ``message``
+    tells the operator what to do instead. Neither ever carries a secret value.
+    """
+    raise ConnectRefusal(rule, message)
 
 
 def has_provider_probe(provider_id: str) -> bool:
@@ -235,6 +264,33 @@ PROVIDERS: tuple[Provider, ...] = (
         metadata_fields=("default_actor",),
         description="Apify research actors and scrape jobs.",
         env_vars=("APIFY_TOKEN",),
+    ),
+    Provider(
+        id="github",
+        name="GitHub",
+        category="work",
+        auth="api_token",
+        # `api_key` matches the slot a GitHub token connected with `--custom`
+        # before this entry existed already uses, so those keep resolving.
+        required_secrets=("api_key",),
+        metadata_fields=("owner",),
+        description=(
+            "A GitHub token for scripts and agents that call the GitHub API directly. "
+            "Day-to-day issue and pull request work still goes through `gh`."
+        ),
+        env_vars=("GITHUB_TOKEN", "GH_TOKEN"),
+    ),
+    Provider(
+        id="ga4",
+        name="Google Analytics 4",
+        category="analytics",
+        auth="oauth_access_token",
+        required_secrets=("access_token",),
+        metadata_fields=("property_id",),
+        description=(
+            "Read access to one Google Analytics 4 property. Record the numeric "
+            "`property_id` so the probe knows which property to check."
+        ),
     ),
     Provider(
         id="hledger",
@@ -474,6 +530,8 @@ def _safe_identity_metadata(metadata: dict[str, Any]) -> dict[str, str]:
         lowered = key.lower().replace("-", "_")
         if key in recorded or value is None or value == "":
             continue
+        if metadata_value_rule(str(value)):
+            continue
         if lowered not in SAFE_METADATA_KEYS and any(
             part in lowered for part in SENSITIVE_KEY_PARTS
         ):
@@ -497,9 +555,12 @@ def _safe_status_metadata(metadata: dict[str, Any]) -> dict[str, str]:
         if raw_value is None or raw_value == "":
             continue
         value = str(raw_value)
-        flagged, _reason = _classify_credential_value(key, value)
-        if flagged or _metadata_key_looks_sensitive(key):
+        if metadata_value_rule(value):
             continue
+        if key.lower().replace("-", "_") not in SAFE_METADATA_KEYS:
+            flagged, _reason = _classify_credential_value(key, value)
+            if flagged or _metadata_key_looks_sensitive(key):
+                continue
         recorded[key] = value
     return recorded
 
@@ -959,21 +1020,316 @@ def _meta_repair(state: str, missing: list[str] | None = None) -> dict[str, str]
     }
 
 
+# Public credential grammars, one per provider family: the prefix plus the
+# shape of the generated part. Each is matched in full, so a word that merely
+# shares a prefix ("re_engagement", "pk_test_publishable") is not a key, and a
+# real-shaped key is caught whatever its characters ("ghp_" plus lowercase).
+# The rule name keeps the prefix so a refusal says which family matched.
+METADATA_SECRET_GRAMMARS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("sk_", re.compile(r"sk_(?:live|test)_[A-Za-z0-9]{8,}")),
+    ("rk_", re.compile(r"rk_(?:live|test)_[A-Za-z0-9]{8,}")),
+    ("pk_live_", re.compile(r"pk_live_[A-Za-z0-9]{8,}")),
+    ("whsec_", re.compile(r"whsec_[A-Za-z0-9+/=]{16,}")),
+    ("re_", re.compile(r"re_[A-Za-z0-9]{8}_[A-Za-z0-9]{16,}")),
+    ("sk-", re.compile(r"sk-[A-Za-z0-9_\-]{20,}")),
+    ("ghp_", re.compile(r"ghp_[A-Za-z0-9]{30,}")),
+    ("gho_", re.compile(r"gho_[A-Za-z0-9]{30,}")),
+    ("ghu_", re.compile(r"ghu_[A-Za-z0-9]{30,}")),
+    ("ghs_", re.compile(r"ghs_[A-Za-z0-9]{30,}")),
+    ("ghr_", re.compile(r"ghr_[A-Za-z0-9]{30,}")),
+    ("github_pat_", re.compile(r"github_pat_[A-Za-z0-9_]{16,}")),
+    ("glpat-", re.compile(r"glpat-[A-Za-z0-9_\-]{20,}")),
+    ("xox", re.compile(r"xox[abposr]-[A-Za-z0-9\-]{10,}")),
+    ("AKIA", re.compile(r"(?:AKIA|ASIA)[A-Z0-9]{16}")),
+    ("AIza", re.compile(r"AIza[A-Za-z0-9_\-]{35}")),
+    ("cfat_", re.compile(r"cfat_[A-Za-z0-9_\-]{20,}")),
+)
+_JWT_RE = re.compile(r"^eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*$")
+# "Bearer <anything>" as the whole value, or "Bearer <long token>" after a
+# label; "bearer" inside an ordinary phrase is not a credential.
+_BEARER_RE = re.compile(r"^bearer\s+\S|\sbearer\s+[A-Za-z0-9._~+/=\-]{16,}", re.IGNORECASE)
+_TOKEN_CHARSET_RE = re.compile(r"^[A-Za-z0-9+/=_.\-]+$")
+# Split a value into words so a credential behind a short label ("note: <key>")
+# is judged on its own: first on spaces, commas and semicolons, then on `:`
+# and `=`. Structured references (URLs, op:// refs, emails) are not split on
+# `:`/`=`; a URL's query values are judged one by one instead.
+_METADATA_CHUNK_SPLIT_RE = re.compile(r"[\s,;]+")
+_METADATA_LABEL_SPLIT_RE = re.compile(r"[:=]")
+_METADATA_URL_START_RE = re.compile(r"(?<![A-Za-z0-9+.\-])[A-Za-z][A-Za-z0-9+.\-]*://")
+_METADATA_URL_PIECE_RE = re.compile(r"[/&?;#@]")
+_METADATA_IPV4_RE = re.compile(r"[0-9]{1,3}(?:\.[0-9]{1,3}){3}")
+_METADATA_URL_DECODE_PASSES = 3
+_METADATA_URL_MAX_DEPTH = 3
+_METADATA_EMAIL_RE = re.compile(r"^[^@\s:=/]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+METADATA_ENTROPY_MIN_LENGTH = 24
+METADATA_ENTROPY_MIN_BITS = 3.5
+# CamelCase and digit segments: "AcmeProd2026" -> Acme, Prod, 2026.
+_METADATA_SEGMENT_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+")
+_METADATA_VERSION_TAIL_RE = re.compile(r"[A-Z][0-9]{1,3}$")
+_VOWELS = frozenset("aeiouyAEIOUY")
+# Abbreviations with digits between words ("CloudflareR2Storage",
+# "B2BMarketing"): capital and digit segments that together form a short code.
+_METADATA_CODE_PART_RE = re.compile(r"[A-Z]+|[0-9]+")
+_METADATA_CODE_MAX_LENGTH = 4
+# At the start or end of a value only the tightest code shape counts ("S3",
+# "B2B"), next to a word of at least this many letters.
+_METADATA_EDGE_CODE_RE = re.compile(r"[A-Z][0-9]{1,2}[A-Z]?")
+_METADATA_EDGE_WORD_MIN_LENGTH = 6
+_METADATA_WORD_RE = re.compile(r"[A-Z][a-z]{3,}")
+_METADATA_CONSONANT_RUN_RE = re.compile(r"[^aeiouyAEIOUY]{4,}")
+# Share of segments that look generated rather than written. Labels are made
+# of words ("Us", "Api", "Name", "2026") and score near 0; random tokens break
+# into single letters, vowel-less runs and lone digits and score well above.
+# Miss rates for this threshold are measured in docs/connect.md.
+METADATA_MIN_GENERATED_SEGMENT_SHARE = 0.3
+
+
+def _shannon_bits_per_char(value: str) -> float:
+    counts: dict[str, int] = {}
+    for char in value:
+        counts[char] = counts.get(char, 0) + 1
+    total = len(value)
+    return -sum((count / total) * math.log2(count / total) for count in counts.values())
+
+
+def _reads_as_word(segment: str) -> bool:
+    """A capitalised, pronounceable word of four or more letters."""
+    if not _METADATA_WORD_RE.fullmatch(segment):
+        return False
+    vowels = sum(char in _VOWELS for char in segment)
+    return vowels * 10 >= 3 * len(segment) and not _METADATA_CONSONANT_RUN_RE.search(segment)
+
+
+def _merge_metadata_codes(segments: list[str]) -> list[str | None]:
+    """Replace short letter-digit codes between words with ``None`` (a word).
+
+    "CloudflareR2Storage" segments as Cloudflare, R, 2, Storage; R and 2 read
+    as generated on their own. Merged, R2 sits between two real words and
+    counts as one word. Random tokens rarely put a code between pronounceable
+    words, so the miss rates in docs/connect.md hold.
+    """
+    merged: list[str | None] = []
+    index = 0
+    while index < len(segments):
+        if not _METADATA_CODE_PART_RE.fullmatch(segments[index]):
+            merged.append(segments[index])
+            index += 1
+            continue
+        end = index
+        while end < len(segments) and _METADATA_CODE_PART_RE.fullmatch(segments[end]):
+            end += 1
+        run = segments[index:end]
+        code = "".join(run)
+        left = segments[index - 1] if index > 0 else None
+        right = segments[end] if end < len(segments) else None
+        if left is not None and right is not None:
+            beside_words = _reads_as_word(left) and _reads_as_word(right)
+        else:
+            neighbour = left if left is not None else right
+            beside_words = (
+                neighbour is not None
+                and _reads_as_word(neighbour)
+                and len(neighbour) >= _METADATA_EDGE_WORD_MIN_LENGTH
+                and bool(_METADATA_EDGE_CODE_RE.fullmatch(code))
+            )
+        if (
+            len(run) > 1
+            and len(code) <= _METADATA_CODE_MAX_LENGTH
+            and any(char.isdigit() for char in code)
+            and beside_words
+        ):
+            merged.append(None)
+        else:
+            merged.extend(run)
+        index = end
+    return merged
+
+
+def _segment_is_generated(segment: str) -> bool:
+    if segment.isdigit():
+        return len(segment) == 1
+    return len(segment) == 1 or not any(char in _VOWELS for char in segment)
+
+
+def _generated_segment_share(value: str) -> float:
+    """Share of CamelCase/digit segments that do not read as words.
+
+    A segment counts as generated when it is a single letter, a letter run
+    with no vowel, or a lone digit. A trailing version such as ``V2`` counts
+    as a word. A short code between words such as ``R2`` or ``B2B`` counts
+    as a word only when every other segment reads as a word too, apart from
+    a final lone digit (``S3ProductionBucketUsWest2``); a code next to a
+    generated tail ("<words>R2<words>Qe7Lo") is judged letter by letter.
+    """
+    body = value
+    version = _METADATA_VERSION_TAIL_RE.search(value)
+    if version:
+        body = value[: version.start()]
+    raw = _METADATA_SEGMENT_RE.findall(body)
+    segments = _merge_metadata_codes(raw)
+    if None in segments:
+        others = [segment for segment in segments if segment is not None]
+        if others and others[-1].isdigit() and segments[-1] is not None:
+            others = others[:-1]
+        if any(_segment_is_generated(segment) for segment in others):
+            segments = list(raw)
+    total = len(segments) + (1 if version else 0)
+    if not total:
+        return 0.0
+    generated = sum(
+        1 for segment in segments if segment is not None and _segment_is_generated(segment)
+    )
+    return generated / total
+
+
+def _word_secret_rule(word: str) -> str:
+    for prefix, grammar in METADATA_SECRET_GRAMMARS:
+        if grammar.fullmatch(word):
+            return f"credential_prefix:{prefix}"
+    if _JWT_RE.fullmatch(word):
+        return "jwt_shape"
+    # Long random-looking strings: mixed case, nothing but token characters,
+    # enough entropy, and segments that do not read as words. Hex ids, UUIDs,
+    # numeric ids, URLs, emails, lowercase paths and CamelCase labels fall
+    # outside this on purpose.
+    if (
+        len(word) >= METADATA_ENTROPY_MIN_LENGTH
+        and _TOKEN_CHARSET_RE.fullmatch(word)
+        and any(char.isupper() for char in word)
+        and any(char.islower() for char in word)
+        and _shannon_bits_per_char(word) >= METADATA_ENTROPY_MIN_BITS
+        and _generated_segment_share(word) >= METADATA_MIN_GENERATED_SEGMENT_SHARE
+    ):
+        return "high_entropy"
+    return ""
+
+
+def _metadata_words(value: str) -> list[str]:
+    """The words of a metadata value that are judged one by one.
+
+    A URL stays whole and contributes its decoded parts: user name,
+    password, path segments, query keys and values, and fragment pieces.
+    Each part is split on ``:`` and ``=`` like a bare value, so
+    ``?campaign=<label>`` is judged as the label and ``/token=<key>``,
+    ``#token:<key>`` or ``?token=<key>`` as the key. An email or env
+    reference stays whole. Anything else is split on ``:`` and ``=`` so
+    "note: <key>" is caught.
+    """
+    words: list[str] = []
+    for chunk in _METADATA_CHUNK_SPLIT_RE.split(value):
+        if _METADATA_EMAIL_RE.fullmatch(chunk) or _looks_like_env_reference(chunk):
+            words.append(chunk)
+            continue
+        url = _METADATA_URL_START_RE.search(chunk)
+        label = chunk[: url.start()] if url else chunk
+        words.extend(word for word in _METADATA_LABEL_SPLIT_RE.split(label) if word)
+        if url:
+            reference = chunk[url.start() :]
+            words.append(reference)
+            for part in _url_parts(reference):
+                words.extend(word for word in _METADATA_LABEL_SPLIT_RE.split(part) if word)
+    return words
+
+
+def _fully_unquote(text: str) -> str:
+    """Percent-decode until stable, at most ``_METADATA_URL_DECODE_PASSES`` times."""
+    for _ in range(_METADATA_URL_DECODE_PASSES):
+        decoded = urllib.parse.unquote(text)
+        if decoded == text:
+            break
+        text = decoded
+    return text
+
+
+def _url_host_labels(netloc: str) -> list[str]:
+    """Host labels as written (case kept), minus IP addresses and punycode."""
+    host = netloc.rpartition("@")[2]
+    if host.startswith("["):
+        return []
+    host = host.split(":", 1)[0]
+    if _METADATA_IPV4_RE.fullmatch(host):
+        return []
+    return [label for label in host.split(".") if not label.lower().startswith("xn--")]
+
+
+def _url_parts(reference: str, depth: int = 0) -> list[str]:
+    """Decoded user name, password, host labels, path, query and fragment pieces.
+
+    Each component is fully decoded before it is split, so an encoded
+    separator (``%2F``) or a double-encoded token is judged as written. A URL
+    nested inside a component is inspected the same way, up to
+    ``_METADATA_URL_MAX_DEPTH`` levels.
+    """
+    try:
+        parsed = urllib.parse.urlsplit(reference)
+        # Reading every field validates it: a bad port or bracket raises here.
+        components = [parsed.username or "", parsed.password or ""]
+        _ = (parsed.hostname, parsed.port)
+    except ValueError:
+        # Unparseable: judge the decoded raw pieces instead.
+        return [piece for piece in _METADATA_URL_PIECE_RE.split(_fully_unquote(reference)) if piece]
+    parts = list(_url_host_labels(parsed.netloc))
+    components += [parsed.path, parsed.query, parsed.fragment]
+    for component in components:
+        decoded = _fully_unquote(component)
+        nested = _METADATA_URL_START_RE.search(decoded)
+        if nested and depth < _METADATA_URL_MAX_DEPTH:
+            parts.extend(_url_parts(decoded[nested.start() :], depth + 1))
+            decoded = decoded[: nested.start()]
+        parts.extend(piece for piece in _METADATA_URL_PIECE_RE.split(decoded) if piece)
+    return parts
+
+
+def metadata_value_rule(value: str) -> str:
+    """Name the secret-shape rule a metadata value trips, or "" when it is safe.
+
+    Judges the value, never the key: a label under a key called ``key_name``
+    is fine, and a live key under an innocent key name is not. The value is
+    judged whole and word by word, so a short label in front of a key does
+    not hide it. The returned rule name is safe to show; the value never is.
+    """
+    candidate = value.strip()
+    if _BEARER_RE.search(candidate):
+        return "bearer_credential"
+    if (
+        _looks_like_env_reference(candidate)
+        or _looks_like_placeholder(candidate)
+        or _looks_like_iso_datetime(candidate)
+    ):
+        return ""
+    words = [candidate, *_metadata_words(candidate)]
+    for word in words:
+        if _looks_like_env_reference(word) or _looks_like_placeholder(word):
+            continue
+        rule = _word_secret_rule(word)
+        if rule:
+            return rule
+    return ""
+
+
 def _parse_metadata(pairs: list[str]) -> dict[str, str]:
     metadata: dict[str, str] = {}
     for pair in pairs:
         if "=" not in pair:
-            raise ValueError(f"metadata must be key=value, got {pair!r}")
+            # Echo the key part only: a bare secret pasted without `=` must
+            # not come back in the error.
+            _refuse(
+                "metadata_format",
+                "metadata must be key=value; one --metadata argument has no `=`.",
+            )
         key, value = pair.split("=", 1)
         key = key.strip()
         value = value.strip()
         if not key:
-            raise ValueError("metadata keys cannot be empty")
-        lowered = key.lower().replace("-", "_")
-        if lowered not in SAFE_METADATA_KEYS and any(
-            part in lowered for part in SENSITIVE_KEY_PARTS
-        ):
-            raise ValueError(f"metadata key {key!r} looks sensitive; use --token/--token-stdin")
+            _refuse("metadata_format", "metadata keys cannot be empty")
+        rule = metadata_value_rule(value)
+        if rule:
+            _refuse(
+                "metadata_secret_value",
+                f"metadata value for {key!r} looks like a secret (rule: {rule}). "
+                "Nothing was stored. Pass the credential with --token-stdin; "
+                "metadata holds labels and ids only.",
+            )
         metadata[key] = value
     return metadata
 
@@ -1073,21 +1429,24 @@ def _validate_key_shape(provider: Provider, token: str, metadata: dict[str, str]
     if not token.startswith(provider.key_prefixes):
         shapes = ", ".join(f"{prefix}…" for prefix in provider.key_prefixes)
         slot = provider.required_secrets[0] if provider.required_secrets else "credential"
-        raise ValueError(
+        _refuse(
+            "key_shape",
             f"the {provider.name} {slot} does not match the expected key shape "
-            f"({shapes}). Nothing was stored; check the value and reconnect."
+            f"({shapes}). Nothing was stored; check the value and reconnect.",
         )
     if provider.id == "stripe":
         mode = str(metadata.get("mode") or "").strip().lower()
         if mode == "live" and token.startswith(("sk_test_", "rk_test_")):
-            raise ValueError(
+            _refuse(
+                "stripe_mode_mismatch",
                 "metadata says mode=live but the key is a Stripe TEST key. "
-                "Nothing was stored; fix the mode or the key and reconnect."
+                "Nothing was stored; fix the mode or the key and reconnect.",
             )
         if mode == "test" and token.startswith(("sk_live_", "rk_live_")):
-            raise ValueError(
+            _refuse(
+                "stripe_mode_mismatch",
                 "metadata says mode=test but the key is a Stripe LIVE key. "
-                "Nothing was stored; fix the mode or the key and reconnect."
+                "Nothing was stored; fix the mode or the key and reconnect.",
             )
 
 
@@ -1101,8 +1460,15 @@ def connect_provider(
     secret_backend: str | None = None,
     scope: str = "repo",
     custom: bool = False,
+    source: str = "",
 ) -> dict[str, Any]:
-    """Connect a provider by writing repo metadata and local secrets."""
+    """Connect a provider by writing repo metadata and local secrets.
+
+    ``source`` is a non-secret reference to where the credential lives, such
+    as ``op://vault/item/field``; it is stored as ``metadata.source`` so
+    `mb connect rotate` can read the credential again. When ``source`` is the
+    only metadata given, the existing metadata is kept and the source added.
+    """
 
     if custom:
         provider = normalize_provider(provider_id, allow_custom=True)
@@ -1114,7 +1480,9 @@ def connect_provider(
         raise ValueError("scope must be repo or user")
     target = Path(repo).resolve()
     metadata = _parse_metadata(metadata_pairs or [])
-    _validate_key_shape(provider, token, metadata)
+    source = source.strip()
+    if source:
+        _check_source_ref(source)
     config = _read_config(target)
     repo_id = _ensure_repo_id(config, target)
     credential_deadline = new_credential_deadline()
@@ -1123,6 +1491,13 @@ def connect_provider(
     if not token and provider.id not in providers:
         raw_existing_entry = _user_scope_provider_entry(repo_id, provider.id)
     existing_entry = raw_existing_entry if isinstance(raw_existing_entry, dict) else {}
+    if source:
+        if not metadata_pairs:
+            raw_existing_metadata = existing_entry.get("metadata")
+            if isinstance(raw_existing_metadata, dict):
+                metadata = {str(key): str(value) for key, value in raw_existing_metadata.items()}
+        metadata["source"] = source
+    _validate_key_shape(provider, token, metadata)
 
     secrets: dict[str, dict[str, str]] = {}
     required = list(provider.required_secrets)
@@ -1589,8 +1964,35 @@ def status_provider(
             "repair": str(validation.get("repair") or ""),
             "repair_command": str(validation.get("repair_command") or ""),
             "safe_to_share": True,
+            **_safe_probe_details(validation),
         },
     }
+
+
+def _safe_probe_details(validation: dict[str, Any]) -> dict[str, Any]:
+    """Recorded probe facts, re-typed so a hand-edited config cannot inject values."""
+    details: dict[str, Any] = {}
+    scopes = validation.get("scopes")
+    if isinstance(scopes, dict):
+        details["scopes"] = {
+            str(name): str(verdict)
+            for name, verdict in scopes.items()
+            if verdict in {"allowed", "refused", "unknown"}
+        }
+    kind = validation.get("token_kind")
+    if kind in GITHUB_TOKEN_KIND_NAMES:
+        details["token_kind"] = kind
+    token_scopes = validation.get("token_scopes")
+    if isinstance(token_scopes, list):
+        details["token_scopes"] = [
+            str(scope)
+            for scope in token_scopes
+            if GITHUB_SCOPE_RE.fullmatch(str(scope)) and not metadata_value_rule(str(scope))
+        ]
+    withheld = validation.get("token_scopes_withheld")
+    if isinstance(withheld, int) and not isinstance(withheld, bool):
+        details["token_scopes_withheld"] = withheld
+    return details
 
 
 def hydrate(
@@ -1771,6 +2173,249 @@ def read_metadata(provider_id: str, repo: str | Path = ".") -> dict[str, str]:
     return _safe_status_metadata(metadata)
 
 
+# Variable `mb connect exec` sets when `--env` is not given: the provider's
+# first registered env var, except where that name is not what the provider's
+# own CLI reads (the Stripe CLI reads STRIPE_API_KEY) or does not hold a token
+# (GOOGLE_APPLICATION_CREDENTIALS is a key-file path). Custom providers and
+# providers with no registered env var get MB_SECRET.
+EXEC_DEFAULT_ENV: dict[str, str] = {
+    "stripe": "STRIPE_API_KEY",
+    "google": "GOOGLE_OAUTH_TOKEN",
+}
+EXEC_FALLBACK_ENV = "MB_SECRET"
+ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def exec_env_name(provider_id: str, override: str = "") -> str:
+    """Name of the variable that carries the secret into the child."""
+    registered = provider_map().get(provider_id)
+    default = EXEC_DEFAULT_ENV.get(provider_id) or (
+        registered.env_vars[0] if registered and registered.env_vars else EXEC_FALLBACK_ENV
+    )
+    name = override.strip() or default
+    if not ENV_NAME_RE.fullmatch(name):
+        _refuse(
+            "exec_env_name",
+            "--env must be a shell variable name: letters, digits and underscores, "
+            "not starting with a digit.",
+        )
+    return name
+
+
+def exec_with_secret(
+    provider_id: str,
+    command: list[str],
+    repo: str | Path = ".",
+    *,
+    env_name: str = "",
+    runner: Callable[..., subprocess.CompletedProcess[Any]] = subprocess.run,
+) -> dict[str, Any]:
+    """Run ``command`` with the stored credential in its environment only.
+
+    No shell is involved and stdin, stdout and stderr are inherited, so the
+    secret travels in the child's environment and nowhere else: it is never
+    printed, logged, or put in the returned dict. ``returncode`` is the
+    child's own exit code.
+    """
+    if not command:
+        _refuse(
+            "exec_no_command",
+            "mb connect exec needs a command after `--`, for example "
+            "`mb connect exec stripe -- stripe products list`.",
+        )
+    result = read_token(provider_id, repo)
+    name = exec_env_name(str(result["provider"]), env_name)
+    outcome: dict[str, Any] = {
+        "ok": False,
+        "provider": result["provider"],
+        "env_name": name,
+        "returncode": 1,
+        "error": "",
+        "repair_command": "",
+    }
+    if not result["ok"]:
+        outcome["error"] = result["error"]
+        outcome["repair_command"] = result["repair_command"]
+        return outcome
+    env = dict(os.environ)
+    env[name] = result["token"]
+    try:
+        completed = runner(command, env=env, check=False)
+    except FileNotFoundError:
+        outcome["returncode"] = 127
+        outcome["error"] = f"command not found: {command[0]}"
+        return outcome
+    except PermissionError:
+        outcome["returncode"] = 126
+        outcome["error"] = f"command is not executable: {command[0]}"
+        return outcome
+    except OSError as exc:
+        # ENOEXEC (a text file without a shebang) and every other launch
+        # failure. Only the errno name goes out: the exception's own text or
+        # a traceback could carry the child environment.
+        outcome["returncode"] = 126
+        reason = errno.errorcode.get(exc.errno or 0, "OSError")
+        outcome["error"] = f"command could not be started ({reason}): {command[0]}"
+        return outcome
+    returncode = int(completed.returncode)
+    # A child killed by a signal reports -N; shells report 128+N.
+    outcome["returncode"] = 128 - returncode if returncode < 0 else returncode
+    outcome["ok"] = outcome["returncode"] == 0
+    return outcome
+
+
+def stdout_exposes_secret(stream: Any = None) -> bool:
+    """Would a raw secret written to ``stream`` land somewhere an agent reads?
+
+    A terminal is read by whoever (or whatever) is watching it, and a pipe
+    feeds the secret into another process's text, which is how secrets end up
+    in agent transcripts. A redirect to a file is the one scripted path that
+    stays allowed. When the descriptor cannot be inspected, assume exposure.
+    """
+    target = stream if stream is not None else sys.stdout
+    try:
+        if target.isatty():
+            return True
+        mode = os.fstat(target.fileno()).st_mode
+    except (AttributeError, OSError, ValueError):
+        return True
+    return stat.S_ISFIFO(mode)
+
+
+ONEPASSWORD_REF_PREFIX = "op://"
+ROTATE_READ_TIMEOUT_SECONDS = 60.0
+
+
+def _check_source_ref(source: str) -> None:
+    """A source is a pointer to the secret, never the secret itself."""
+    rule = metadata_value_rule(source)
+    if rule:
+        _refuse(
+            "source_secret_value",
+            f"--source looks like a secret (rule: {rule}), not a reference to one. "
+            "Nothing was stored. Pass a reference such as op://vault/item/field.",
+        )
+
+
+def _connected_entry(provider: Provider, repo: Path) -> tuple[dict[str, Any] | None, str]:
+    config = _read_config(repo)
+    entry = config["providers"].get(provider.id)
+    if isinstance(entry, dict):
+        return entry, "repo"
+    repo_id = str(config.get("repo_id") or _repo_identity(repo)["repo_id"])
+    user_entry = _user_scope_provider_entry(repo_id, provider.id)
+    if isinstance(user_entry, dict):
+        return user_entry, "user"
+    return None, ""
+
+
+def _read_onepassword_ref(
+    ref: str,
+    *,
+    which_func: Which | None = None,
+    command_runner: CommandRunner | None = None,
+) -> str:
+    """Read one secret with `op read`. The value is returned, never printed."""
+    which = which_func or shutil.which
+    run = command_runner or _run_command
+    if not which("op"):
+        _refuse(
+            "rotate_op_missing",
+            "the 1Password CLI (`op`) is not installed or not on PATH. Install it and "
+            "sign in (`op signin`), then rerun `mb connect rotate`.",
+        )
+    result = run(["op", "read", "--no-newline", ref], None, ROTATE_READ_TIMEOUT_SECONDS)
+    if not result.get("ok"):
+        stderr = str(result.get("stderr") or "").lower()
+        if any(marker in stderr for marker in ("signed in", "sign in", "signin")):
+            _refuse(
+                "rotate_op_signed_out",
+                "the 1Password CLI is not signed in. Run `op signin` (or unlock the "
+                "1Password app), then rerun `mb connect rotate`.",
+            )
+        _refuse(
+            "rotate_op_read_failed",
+            f"`op read` could not read the recorded source (exit {result.get('returncode')}). "
+            "Check the op:// reference with `mb connect status`, then rerun.",
+        )
+    value = str(result.get("stdout") or "")
+    if value.endswith("\n"):
+        value = value[:-1]
+    if not value:
+        _refuse(
+            "rotate_empty_value",
+            "the recorded source returned an empty value. Nothing was stored.",
+        )
+    return value
+
+
+def rotate_provider(
+    provider_id: str,
+    repo: str | Path = ".",
+    *,
+    which_func: Which | None = None,
+    command_runner: CommandRunner | None = None,
+) -> dict[str, Any]:
+    """Re-read a credential from its recorded source, store it, then probe it."""
+    provider = resolve_provider(provider_id, repo)
+    target = Path(repo).resolve()
+    if not provider.required_secrets:
+        _refuse("rotate_no_secret", f"{provider.name} stores no secret to rotate.")
+    entry, _where = _connected_entry(provider, target)
+    if entry is None:
+        _refuse(
+            "rotate_not_connected",
+            f"{provider.name} is not connected. Connect it with a source first: "
+            f"`{_connect_command(provider, token_stdin=True)} --source op://vault/item/field`.",
+        )
+    raw_metadata = entry.get("metadata")
+    metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
+    source = str(metadata.get("source") or "").strip()
+    if not source:
+        _refuse(
+            "rotate_no_source",
+            f"{provider.name} has no recorded source, so Main Branch does not know where "
+            "to read the new credential from. Record one with "
+            f"`mb connect {provider.id} --source op://vault/item/field`, or reconnect "
+            f"the new credential with `{_connect_command(provider, token_stdin=True)}`.",
+        )
+    if not source.startswith(ONEPASSWORD_REF_PREFIX):
+        _refuse(
+            "rotate_unsupported_source",
+            "mb connect rotate reads only 1Password references (op://...). For any other "
+            f"source, reconnect with `{_connect_command(provider, token_stdin=True)}`.",
+        )
+    secret = _read_onepassword_ref(source, which_func=which_func, command_runner=command_runner)
+    raw_secrets = entry.get("secrets")
+    secrets = raw_secrets if isinstance(raw_secrets, dict) else {}
+    raw_primary = secrets.get(provider.required_secrets[0])
+    primary = raw_primary if isinstance(raw_primary, dict) else {}
+    backend = str(primary.get("backend") or "") or None
+    connected = connect_provider(
+        provider.id,
+        target,
+        token=secret,
+        account_label=str(entry.get("account_label") or ""),
+        metadata_pairs=[f"{key}={value}" for key, value in metadata.items()],
+        secret_backend=backend,
+        scope=str(entry.get("scope") or "repo"),
+        custom=provider.category == "custom",
+    )
+    tested = test_provider(
+        provider.id, target, which_func=which_func, command_runner=command_runner
+    )
+    return {
+        "ok": bool(connected["ok"]) and bool(tested["ok"]),
+        "provider": provider.id,
+        "source_kind": "1password",
+        "stored": bool(connected["ok"]),
+        "provider_verified": bool(tested.get("provider_verified")),
+        "validation": tested.get("validation") or {},
+        "status": tested["status"],
+        "safe_to_share": True,
+    }
+
+
 def _provider_error_summary(provider_name: str, upstream: dict[str, Any]) -> str:
     status = upstream.get("http_status")
     messages = [str(item) for item in upstream.get("error_messages", []) if str(item)]
@@ -1857,15 +2502,37 @@ def _extract_upstream_errors(
     return codes, messages
 
 
+RESPONSE_HEADER_MAX_CHARS = 512
+
+
 def _http_get_json(
     url: str,
     headers: dict[str, str] | None = None,
     *,
     provider_name: str = "provider",
     endpoint_family: str = "unknown",
+    response_headers: tuple[str, ...] = (),
 ) -> dict[str, Any]:
+    """GET ``url`` and report a share-safe outcome.
+
+    ``response_headers`` names non-secret response headers to hand back under
+    ``headers`` (for example GitHub's ``X-OAuth-Scopes``). The body is never
+    returned.
+    """
     request = urllib.request.Request(url, headers=headers or {})
     secret_values = tuple(_header_secret_candidates(headers))
+
+    def picked(raw: Any) -> dict[str, str]:
+        # A response header is provider-controlled text: redact anything the
+        # request sent as a secret and cap its length before handing it back.
+        found: dict[str, str] = {}
+        for name in response_headers:
+            value = raw.get(name) if raw is not None else None
+            if value is not None:
+                text = _redact_sensitive_text(value, secret_values)
+                found[name] = text[:RESPONSE_HEADER_MAX_CHARS]
+        return found
+
     upstream: dict[str, Any] = {
         "endpoint_family": endpoint_family,
         "http_status": None,
@@ -1874,11 +2541,14 @@ def _http_get_json(
         "error_messages": [],
         "safe_to_share": True,
     }
+    got_headers: dict[str, str] = {}
     try:
         with urllib.request.urlopen(request, timeout=VALIDATION_TIMEOUT_SECONDS) as response:
             status = int(getattr(response, "status", 0) or 0)
             body = response.read(8192)
+            got_headers = picked(getattr(response, "headers", None))
     except urllib.error.HTTPError as exc:
+        got_headers = picked(exc.headers)
         body = b""
         with suppress(OSError):
             body = exc.read(8192)
@@ -1902,6 +2572,7 @@ def _http_get_json(
             "summary": _provider_error_summary(provider_name, upstream),
             "upstream": upstream,
             "safe_to_share": True,
+            "headers": got_headers,
         }
     except (urllib.error.URLError, TimeoutError, OSError):
         return {
@@ -1910,6 +2581,7 @@ def _http_get_json(
             "summary": f"{provider_name} validation could not reach the service.",
             "upstream": upstream,
             "safe_to_share": True,
+            "headers": got_headers,
         }
     payload = {}
     if body:
@@ -1932,6 +2604,7 @@ def _http_get_json(
             "summary": _provider_error_summary(provider_name, upstream),
             "upstream": upstream,
             "safe_to_share": True,
+            "headers": got_headers,
         }
     if isinstance(payload, dict) and payload.get("success") is False:
         return {
@@ -1940,6 +2613,7 @@ def _http_get_json(
             "summary": _provider_error_summary(provider_name, upstream),
             "upstream": upstream,
             "safe_to_share": True,
+            "headers": got_headers,
         }
     token_status = ""
     if isinstance(payload, dict) and isinstance(payload.get("result"), dict):
@@ -1952,6 +2626,7 @@ def _http_get_json(
             "summary": f"{provider_name} token is {token_status}; reconnect an active token.",
             "upstream": upstream,
             "safe_to_share": True,
+            "headers": got_headers,
         }
     return {
         "ok": True,
@@ -1959,6 +2634,7 @@ def _http_get_json(
         "summary": f"{provider_name} credential validated with provider.",
         "upstream": upstream,
         "safe_to_share": True,
+        "headers": got_headers,
     }
 
 
@@ -2152,6 +2828,172 @@ def _validate_meta_with_cli(
     )
 
 
+# Read-only resources the Stripe probe lists to learn what a key may read.
+# Each is a GET with limit=1; the body is never returned.
+STRIPE_SCOPE_PROBES: tuple[tuple[str, str], ...] = (
+    ("products", "https://api.stripe.com/v1/products?limit=1"),
+    ("prices", "https://api.stripe.com/v1/prices?limit=1"),
+    ("customers", "https://api.stripe.com/v1/customers?limit=1"),
+    ("charges", "https://api.stripe.com/v1/charges?limit=1"),
+    ("balance", "https://api.stripe.com/v1/balance"),
+)
+GITHUB_API_HEADERS = {
+    "Accept": "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+    "User-Agent": "mainbranch-mb-connect",
+}
+GITHUB_TOKEN_KINDS: tuple[tuple[str, str], ...] = (
+    ("github_pat_", "fine_grained"),
+    ("ghp_", "classic"),
+    ("gho_", "oauth"),
+    ("ghu_", "app_user"),
+    ("ghs_", "app_installation"),
+)
+# Share-safe probe facts carried from a probe into the recorded validation.
+PROBE_DETAIL_KEYS: tuple[str, ...] = (
+    "scopes",
+    "token_kind",
+    "token_scopes",
+    "token_scopes_withheld",
+)
+GITHUB_TOKEN_KIND_NAMES = frozenset({kind for _prefix, kind in GITHUB_TOKEN_KINDS} | {"unknown"})
+GA4_PROPERTY_RE = re.compile(r"^(?:properties/)?(\d{1,20})$")
+
+
+def _probe_stripe(provider: Provider, secret: str) -> dict[str, Any]:
+    """Which of a fixed set of read resources does this key allow?
+
+    A 2xx means allowed and a 403 means the key is valid but restricted from
+    that resource. A 401 anywhere means Stripe rejected the key itself.
+    """
+    scopes: dict[str, str] = {}
+    first_upstream: dict[str, Any] = {}
+    for resource, url in STRIPE_SCOPE_PROBES:
+        result = _http_get_json(
+            url,
+            {"Authorization": f"Bearer {secret}"},
+            provider_name=provider.name,
+            endpoint_family=f"stripe_{resource}_read",
+        )
+        raw_upstream = result.get("upstream")
+        upstream: dict[str, Any] = raw_upstream if isinstance(raw_upstream, dict) else {}
+        if not first_upstream:
+            first_upstream = upstream
+        status = upstream.get("http_status")
+        if status == 401:
+            return {**result, "state": "invalid", "scopes": scopes}
+        if result.get("ok"):
+            scopes[resource] = "allowed"
+        elif status == 403:
+            scopes[resource] = "refused"
+        else:
+            scopes[resource] = "unknown"
+    allowed = [name for name, verdict in scopes.items() if verdict == "allowed"]
+    refused = [name for name, verdict in scopes.items() if verdict == "refused"]
+    if not allowed and not refused:
+        return {
+            "ok": False,
+            "state": "unvalidated",
+            "summary": "Stripe validation could not reach the service or got no clear answer.",
+            "upstream": first_upstream,
+            "scopes": scopes,
+        }
+    if allowed:
+        summary = f"Stripe key validated; reads allowed: {', '.join(allowed)}"
+    else:
+        summary = "Stripe key validated, but every probed read was refused"
+    if refused:
+        summary += f"; refused: {', '.join(refused)}"
+    return {
+        "ok": True,
+        "state": "ready",
+        "summary": summary + ".",
+        "upstream": first_upstream,
+        "scopes": scopes,
+    }
+
+
+def _github_token_kind(secret: str) -> str:
+    for prefix, kind in GITHUB_TOKEN_KINDS:
+        if secret.startswith(prefix):
+            return kind
+    return "unknown"
+
+
+GITHUB_SCOPE_RE = re.compile(r"[a-z][a-z_]{0,31}(?::[a-z][a-z_]{0,31})?")
+
+
+def _probe_github(provider: Provider, secret: str) -> dict[str, Any]:
+    """Authenticated-user read, plus the scopes GitHub reports for the token."""
+    result = _http_get_json(
+        "https://api.github.com/user",
+        {"Authorization": f"Bearer {secret}", **GITHUB_API_HEADERS},
+        provider_name=provider.name,
+        endpoint_family="github_authenticated_user",
+        response_headers=("X-OAuth-Scopes",),
+    )
+    kind = _github_token_kind(secret)
+    raw_headers = result.get("headers")
+    headers: dict[str, Any] = raw_headers if isinstance(raw_headers, dict) else {}
+    raw_scopes = headers.get("X-OAuth-Scopes")
+    reported = (
+        [scope.strip() for scope in str(raw_scopes).split(",") if scope.strip()]
+        if raw_scopes is not None
+        else []
+    )
+    # Only scope names in GitHub's own grammar ("repo", "read:org") go into
+    # output and stored validation; anything else is counted, never shown.
+    token_scopes = [scope for scope in reported if GITHUB_SCOPE_RE.fullmatch(scope)]
+    withheld = len(reported) - len(token_scopes)
+    probed = {**result, "token_kind": kind, "token_scopes": token_scopes}
+    if withheld:
+        probed["token_scopes_withheld"] = withheld
+    if result.get("ok"):
+        if raw_scopes is not None:
+            listed = ", ".join(token_scopes) or "none"
+            note = f" ({withheld} unrecognized value(s) withheld)" if withheld else ""
+            probed["summary"] = f"GitHub token authenticated; scopes: {listed}{note}."
+        else:
+            probed["summary"] = (
+                "GitHub token authenticated. GitHub does not list a fine-grained or app "
+                "token's permissions through the API; check them in the token's settings."
+            )
+    return probed
+
+
+def _probe_ga4(provider: Provider, secret: str, metadata: dict[str, Any]) -> dict[str, Any]:
+    """Read one property's metadata from the GA4 Admin API."""
+    raw_property = str(metadata.get("property_id") or "").strip()
+    match = GA4_PROPERTY_RE.fullmatch(raw_property)
+    if not match:
+        reason = "is not a numeric GA4 property id" if raw_property else "is not recorded"
+        return {
+            "ok": False,
+            "state": "unvalidated",
+            "summary": f"GA4 validation needs `property_id` metadata, which {reason}.",
+            "repair": (
+                "Find the numeric property id under GA4 Admin > Property details, then run "
+                "`mb connect ga4 --metadata property_id=<property-id>` and "
+                "`mb connect test ga4`."
+            ),
+            "repair_command": "mb connect ga4 --metadata property_id=<property-id>",
+            "upstream": {
+                "endpoint_family": "ga4_property_read",
+                "http_status": None,
+                "response_received": False,
+                "error_codes": [],
+                "error_messages": [],
+                "safe_to_share": True,
+            },
+        }
+    return _http_get_json(
+        f"https://analyticsadmin.googleapis.com/v1beta/properties/{match.group(1)}",
+        {"Authorization": f"Bearer {secret}"},
+        provider_name=provider.name,
+        endpoint_family="ga4_property_read",
+    )
+
+
 def _validate_with_provider(
     provider: Provider,
     secret: str,
@@ -2233,6 +3075,12 @@ def _validate_with_provider(
             provider_name=provider.name,
             endpoint_family="apify_user_me",
         )
+    elif provider.id == "stripe":
+        result = _probe_stripe(provider, secret)
+    elif provider.id == "github":
+        result = _probe_github(provider, secret)
+    elif provider.id == "ga4":
+        result = _probe_ga4(provider, secret, metadata)
     elif provider.id == "meta":
         return _validate_meta_with_cli(
             provider,
@@ -2268,6 +3116,7 @@ def _validate_with_provider(
         "repair_command": str(result.get("repair_command") or ""),
         "safe_to_share": True,
         "upstream": result.get("upstream", {}),
+        **{key: result[key] for key in PROBE_DETAIL_KEYS if key in result},
     }
 
 
@@ -2361,6 +3210,9 @@ def test_provider(
         entry["validation"]["repair_command"] = validation.get("repair_command", "")
     if isinstance(validation.get("upstream"), dict):
         entry["validation"]["upstream"] = validation["upstream"]
+    for key in PROBE_DETAIL_KEYS:
+        if key in validation:
+            entry["validation"][key] = validation[key]
     entry["last_checked_at"] = validation["checked_at"]
     config["providers"][provider.id] = entry
     _write_config(target, config)
@@ -3335,8 +4187,17 @@ def render_test_result(result: dict[str, Any]) -> None:
         if isinstance(codes, list) and codes:
             details.append(f"codes: {', '.join(str(code) for code in codes[:3])}")
         print("provider: " + "  ".join(details))
+    scopes = validation.get("scopes") if isinstance(validation, dict) else None
+    if isinstance(scopes, dict) and scopes:
+        print("reads: " + "  ".join(f"{name}={verdict}" for name, verdict in scopes.items()))
     if status.get("repair_command"):
         print(f"next: {status['repair_command']}")
+
+
+def render_rotate_result(result: dict[str, Any]) -> None:
+    stored = "stored" if result["stored"] else "not stored"
+    print(f"mb connect rotate {result['provider']}: re-read from 1Password, {stored}")
+    render_test_result(result)
 
 
 def render_hydrate_result(result: dict[str, Any]) -> None:

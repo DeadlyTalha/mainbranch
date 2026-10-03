@@ -7,13 +7,15 @@ because that's the working pattern.
 
 from __future__ import annotations
 
+import functools
 import json
 import math
 import os
 import sys
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, NoReturn, TypeVar
 
 import typer
 
@@ -63,6 +65,9 @@ app = typer.Typer(
     no_args_is_help=False,
     invoke_without_command=True,
     add_completion=False,
+    # Some supported Typer versions print every frame's local variables in a
+    # crash traceback, which for `mb connect` includes stored credentials.
+    pretty_exceptions_show_locals=False,
 )
 
 skill_app = typer.Typer(
@@ -567,6 +572,11 @@ workflow_app = typer.Typer(
 )
 app.add_typer(workflow_app, name="workflow")
 
+CONNECT_EXEC_COMMAND_ARGUMENT = typer.Argument(
+    None,
+    help="With `mb connect exec <provider> --`, the command to run and its arguments.",
+    show_default=False,
+)
 CONNECT_METADATA_OPTION = typer.Option(
     [],
     "--metadata",
@@ -1502,19 +1512,49 @@ def issue_open_cmd(
     raise typer.Exit(0 if result["ok"] else 1)
 
 
+_F = TypeVar("_F", bound=Callable[..., Any])
+
+
+def _no_secret_traceback(func: _F) -> _F:
+    """Turn an unexpected error into a one-line message with no traceback.
+
+    Credential-bearing commands hold secrets in local variables. Whether a
+    crash traceback prints them depends on the installed Typer, Click and
+    Rich, so these commands never let one reach the excepthook.
+    """
+
+    @functools.wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return func(*args, **kwargs)
+        except (typer.Exit, typer.Abort):
+            raise
+        except Exception as exc:
+            typer.echo(
+                f"mb {func.__name__.removesuffix('_cmd')}: unexpected error "
+                f"({type(exc).__name__}); details are hidden because they may hold a secret",
+                err=True,
+            )
+            raise typer.Exit(1) from None
+
+    return wrapper  # type: ignore[return-value]
+
+
 @app.command("connect")
+@_no_secret_traceback
 def connect_cmd(
     target: str = typer.Argument(
         "",
         help=(
             "Provider to connect, or `list` / `plan` / `status` / `doctor` / `hygiene` / "
-            "`identity` / `test` / `token` / `hydrate`."
+            "`identity` / `test` / `exec` / `rotate` / `token` / `hydrate`."
         ),
     ),
     provider: str = typer.Argument(
         "",
         help="Provider for subcommands such as `mb connect test <provider>`.",
     ),
+    command: list[str] = CONNECT_EXEC_COMMAND_ARGUMENT,
     repo: str = typer.Option(".", "--repo", help="Business repo whose metadata is updated."),
     account_label: str = typer.Option("", "--account", "--label", help="Human account label."),
     scope: str = typer.Option(
@@ -1551,9 +1591,31 @@ def connect_cmd(
         "--all",
         help="With `mb connect status`, include providers not connected yet.",
     ),
+    env_name: str = typer.Option(
+        "",
+        "--env",
+        help="With `mb connect exec`, the variable that carries the secret into the command.",
+    ),
+    source: str = typer.Option(
+        "",
+        "--source",
+        help=(
+            "Non-secret reference to where the credential lives, such as "
+            "op://vault/item/field. Stored as metadata so `mb connect rotate` can re-read it."
+        ),
+    ),
+    print_token: bool = typer.Option(
+        False,
+        "--print",
+        help="With `mb connect token`, print even when stdout is a terminal or a pipe.",
+    ),
     json_out: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Connect provider credentials without committing secrets."""
+    command = command or []
+    if command and target != "exec":
+        typer.echo(f"mb connect: unexpected extra argument {command[0]!r}", err=True)
+        raise typer.Exit(2)
     if not target:
         try:
             result = connect_mod.list_providers(repo)
@@ -1665,6 +1727,50 @@ def connect_cmd(
         else:
             connect_mod.render_hydrate_result(result)
         raise typer.Exit(0 if result["ok"] else 1)
+    if target == "exec":
+        if not provider:
+            typer.echo("mb connect exec: provider required", err=True)
+            raise typer.Exit(2)
+        if json_out:
+            typer.echo(
+                "mb connect exec: --json is not supported; the command's own output is passed "
+                "through",
+                err=True,
+            )
+            raise typer.Exit(2)
+        try:
+            outcome = connect_mod.exec_with_secret(provider, command, repo, env_name=env_name)
+        except connect_mod.ConfigBoundaryError as exc:
+            _connect_boundary_exit("mb connect exec", exc)
+        except ValueError as exc:
+            typer.echo(f"mb connect exec: {exc}", err=True)
+            raise typer.Exit(2) from exc
+        if outcome["error"]:
+            typer.echo(f"mb connect exec: {outcome['error']}", err=True)
+            if outcome["repair_command"]:
+                typer.echo(f"repair: {outcome['repair_command']}", err=True)
+        raise typer.Exit(outcome["returncode"])
+    if target == "rotate":
+        if not provider:
+            typer.echo("mb connect rotate: provider required", err=True)
+            raise typer.Exit(2)
+        try:
+            result = connect_mod.rotate_provider(provider, repo)
+        except connect_mod.ConfigBoundaryError as exc:
+            _connect_boundary_exit("mb connect rotate", exc)
+        except ValueError as exc:
+            typer.echo(f"mb connect rotate: {exc}", err=True)
+            raise typer.Exit(2) from exc
+        except RuntimeError as exc:
+            typer.echo(f"mb connect rotate: {exc}", err=True)
+            raise typer.Exit(1) from exc
+        if json_out:
+            typer.echo(json.dumps(result, indent=2))
+        else:
+            connect_mod.render_rotate_result(result)
+        if not result["stored"]:
+            raise typer.Exit(1)
+        raise typer.Exit(1 if connect_mod.provider_needs_action(result["status"]) else 0)
     if target == "token":
         if not provider:
             typer.echo("mb connect token: provider required", err=True)
@@ -1676,6 +1782,15 @@ def connect_cmd(
             )
             raise typer.Exit(2)
         try:
+            if not print_token and connect_mod.stdout_exposes_secret():
+                connect_mod._refuse(
+                    "token_print",
+                    "refusing to print the secret to a terminal or a pipe, where it lands "
+                    "in a transcript. Run the command with it instead: "
+                    f"`mb connect exec {provider} -- <command>`. A script that must write "
+                    f"the raw value to a file can use `mb connect token {provider} --print "
+                    "> file`.",
+                )
             result = connect_mod.read_token(provider, repo)
         except ValueError as exc:
             typer.echo(f"mb connect token: {exc}", err=True)
@@ -1753,6 +1868,7 @@ def connect_cmd(
             metadata_pairs=metadata,
             scope=scope,
             custom=custom,
+            source=source,
         )
         result["credential_source"] = {
             "type": credential_source if secret_value else "missing",
