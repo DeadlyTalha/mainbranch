@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -34,8 +37,18 @@ VERSION_RE = re.compile(r'__version__\s*=\s*["\']([^"\']+)["\']')
 CLONE_UPDATE_COMMAND = ["git", "pull", "--ff-only", "origin", "main"]
 # `@latest` rather than `uv tool upgrade`: it also clears an exact-version pin
 # left behind by an earlier `uv tool install mainbranch==X` (#963).
-UV_UPDATE_COMMAND = ["uv", "tool", "install", f"{PACKAGE_NAME}@latest"]
-UV_UPDATE_COMMAND_TEXT = "uv tool install mainbranch@latest"
+# `--refresh-package` makes uv re-read the index for this one package; without
+# it, minutes after a release uv can resolve `@latest` from its cached index and
+# reinstall the version already installed (#1008).
+UV_UPDATE_COMMAND = [
+    "uv",
+    "tool",
+    "install",
+    "--refresh-package",
+    PACKAGE_NAME,
+    f"{PACKAGE_NAME}@latest",
+]
+UV_UPDATE_COMMAND_TEXT = "uv tool install --refresh-package mainbranch mainbranch@latest"
 UV_MANUAL_MESSAGE = (
     "Main Branch was installed as a uv tool. Upgrading replaces the installed "
     "command, so it only runs after an explicit yes at an interactive prompt. "
@@ -53,6 +66,15 @@ WHEEL_MANUAL_MESSAGE = (
 UV_TOOL_DIR_COMMAND = ["uv", "tool", "dir"]
 UV_TOOL_DIR_TIMEOUT_SECONDS = 10.0
 PIP_UPDATE_COMMAND_TEXT = "pip install --upgrade mainbranch"
+SURFACE_PLAN_NO_TERMINAL_MESSAGE = (
+    "Left tracked files unchanged: {files}. Without an interactive terminal, "
+    "`mb update` does not change tracked files in the business repo. Applying "
+    "these changes is the operator's step: review them, then run the commands "
+    "below from a terminal."
+)
+SURFACE_PLAN_DECLINED_MESSAGE = (
+    "Left tracked files unchanged: {files}. Run the commands below whenever you want these changes."
+)
 GITHUB_RELEASE_API_URL_TEMPLATE = (
     "https://api.github.com/repos/noontide-co/mainbranch/releases/tags/oe-v{version}"
 )
@@ -69,6 +91,8 @@ def _run_command(
         return subprocess.run(
             args,
             cwd=str(cwd) if cwd is not None else None,
+            # Children never read the operator's typing meant for our prompts.
+            stdin=subprocess.DEVNULL,
             text=True,
             capture_output=True,
             check=False,
@@ -188,6 +212,19 @@ def _confirm_uv_update(command: str, root: Path | None) -> bool:
     print(f"This will run: {command}")
     try:
         answer = input("Run it now? [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return answer in {"y", "yes"}
+
+
+def _confirm_surface_writes(repo: Path, files: list[str]) -> bool:
+    """Ask once before refreshing agent surfaces changes tracked files. Default is no."""
+    print(f"Refreshing agent surfaces would change these tracked files in {repo}:")
+    for path in files:
+        print(f"  - {path}")
+    try:
+        answer = input("Apply these changes now? [y/N]: ").strip().lower()
     except (EOFError, KeyboardInterrupt):
         print()
         return False
@@ -385,6 +422,136 @@ def _repair_codex_surface(repo: Path) -> tuple[bool, list[str], list[str], dict[
     return True, [], warnings, payload
 
 
+def _json_command(args: list[str], label: str) -> tuple[dict[str, Any] | None, list[str]]:
+    result = _run_command(args)
+    if result.returncode != 0:
+        return None, [_command_error(label, result)]
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None, [f"{label} returned invalid JSON"]
+    if not isinstance(payload, dict):
+        return None, [f"{label} returned an unexpected JSON payload"]
+    if payload.get("ok") is not True:
+        raw_errors = payload.get("errors", [])
+        errors = [str(item) for item in raw_errors] if isinstance(raw_errors, list) else []
+        return payload, errors or [f"{label} failed"]
+    return payload, []
+
+
+def _plan_skill_link(repo: Path) -> tuple[dict[str, Any] | None, list[str]]:
+    return _json_command(
+        ["mb", "skill", "link", "--repo", str(repo), "--plan", "--json"],
+        "mb skill link --plan",
+    )
+
+
+def _plan_codex_surface(repo: Path) -> tuple[dict[str, Any] | None, list[str]]:
+    return _json_command(
+        ["mb", "doctor", "repair", "--repo", str(repo), "--plan", "--only", "codex", "--json"],
+        "mb doctor repair --plan --only codex",
+    )
+
+
+CODEX_SURFACE_ACTION_IDS = ("codex-agents-md", "codex-global-skill")
+CHANGE_LABELS = {
+    "delete": "delete",
+    "delete_tree": "delete",
+    "replace_link": "replace link",
+    "create_link": "new link",
+    "create": "create",
+}
+
+
+def _changes_from(items: Any) -> list[dict[str, str]] | None:
+    if not isinstance(items, list):
+        return None
+    return [
+        {"path": str(item.get("path") or ""), "op": str(item.get("op") or "")}
+        for item in items
+        if isinstance(item, dict)
+    ]
+
+
+def _codex_tracked_changes(plan: dict[str, Any]) -> list[dict[str, str]] | None:
+    """Tracked files the planned Codex repair would change, or None if unknown.
+
+    `mb doctor repair --plan` resolves every destination (AGENTS.md, the
+    transitional repo files it removes, each global skill file) through
+    symlinks and asks git whether it is tracked (#1012).
+    """
+    changes: list[dict[str, str]] = []
+    for action in plan.get("actions", []):
+        if not isinstance(action, dict) or action.get("id") not in CODEX_SURFACE_ACTION_IDS:
+            continue
+        found = _changes_from(action.get("tracked_changes"))
+        if found is None:
+            return None
+        changes.extend(found)
+    return changes
+
+
+def _change_label(change: dict[str, str]) -> str:
+    label = CHANGE_LABELS.get(change["op"])
+    return f"{change['path']} ({label})" if label else change["path"]
+
+
+def _tracked_snapshot(repo: Path) -> dict[str, str] | None:
+    """Status and content hash of every changed tracked file, or None outside git."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "status", "--porcelain=v1", "-z", "--untracked-files=no"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    fields = proc.stdout.split("\0")
+    snapshot: dict[str, str] = {}
+    index = 0
+    while index < len(fields):
+        entry = fields[index]
+        index += 1
+        if len(entry) < 4:
+            continue
+        status, path = entry[:2], entry[3:]
+        if status[0] in "RC":
+            index += 1  # the original path of a rename or copy
+        snapshot[path] = f"{status}:{_content_hash(repo / path)}"
+    return snapshot
+
+
+def _content_hash(path: Path) -> str:
+    try:
+        if path.is_symlink():
+            return "link:" + os.readlink(path)
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return "-"
+
+
+def _unapproved_tracked_changes(
+    before: dict[str, str], after: dict[str, str], allowed: list[str]
+) -> list[str]:
+    changed = sorted(path for path in {*before, *after} if before.get(path) != after.get(path))
+    prefixes = [item.rstrip("/") for item in allowed]
+    return [
+        path
+        for path in changed
+        if not any(path == prefix or path.startswith(prefix + "/") for prefix in prefixes)
+    ]
+
+
+def _repo_flag(repo: Path) -> str:
+    """` --repo <path>` for a command the operator may paste, shell-quoted."""
+    return "" if repo == Path.cwd().resolve() else f" --repo {shlex.quote(str(repo))}"
+
+
 def _base_result(
     repo: Path,
     *,
@@ -420,6 +587,11 @@ def _base_result(
             "codex": {},
             "commands": [],
             "skipped": [] if refresh_surfaces else ["claude", "codex"],
+            "planned": {
+                "consent": "not_needed",
+                "tracked_files": [],
+                "apply_commands": [],
+            },
         },
     }
 
@@ -545,6 +717,175 @@ def _add_plugin_follow_up(result: dict[str, Any], repo: Path) -> None:
         result["next_actions"].append(PLUGIN_INSTALL_COMMAND)
 
 
+def _refresh_surfaces(
+    result: dict[str, Any],
+    target_repo: Path,
+    *,
+    wants_prompt: bool,
+    confirm: Callable[[Path, list[str]], bool],
+) -> None:
+    """Refresh Claude links and Codex guidance; tracked-file writes need a yes.
+
+    Each surface is planned first. A surface whose plan changes no tracked repo
+    file (gitignored skill links, the global Codex skill bundle) refreshes as
+    before. A surface that would change one (`.gitignore`, `AGENTS.md`) is
+    applied only after one yes at an interactive prompt; otherwise its plan and
+    apply command are reported and the repo is left as it was (#1012).
+    """
+    surface = result["surface_refresh"]
+    planned = surface["planned"]
+
+    link_plan, link_plan_errors = _plan_skill_link(target_repo)
+    result["actions"].append(f"ran `mb skill link --repo {target_repo} --plan --json`")
+    if link_plan_errors:
+        result["ok"] = False
+        result["errors"].extend(link_plan_errors)
+        return
+    codex_plan, codex_plan_errors = _plan_codex_surface(target_repo)
+    result["actions"].append(
+        f"ran `mb doctor repair --repo {target_repo} --plan --only codex --json`"
+    )
+    if codex_plan_errors:
+        result["ok"] = False
+        result["errors"].extend(codex_plan_errors)
+        return
+    link_plan = link_plan or {}
+    codex_plan = codex_plan or {}
+
+    link_changes = _changes_from(link_plan.get("tracked_changes"))
+    codex_changes = _codex_tracked_changes(codex_plan)
+    if link_changes is None or codex_changes is None:
+        result["ok"] = False
+        result["errors"].append(
+            "the installed `mb` did not report which tracked files the surface refresh "
+            "would change, so nothing was refreshed. Upgrade Main Branch, then run "
+            "`mb update` again."
+        )
+        return
+    link_writes = list(dict.fromkeys(item["path"] for item in link_changes))
+    codex_writes = list(dict.fromkeys(item["path"] for item in codex_changes))
+    tracked_changes = list(
+        {(c["path"], c["op"]): c for c in [*link_changes, *codex_changes]}.values()
+    )
+    tracked_files = list(dict.fromkeys([*link_writes, *codex_writes]))
+    planned["tracked_files"] = tracked_files
+    planned["tracked_changes"] = tracked_changes
+
+    approved = False
+    if tracked_files:
+        if wants_prompt:
+            approved = confirm(target_repo, [_change_label(item) for item in tracked_changes])
+            planned["consent"] = "approved" if approved else "declined"
+        else:
+            planned["consent"] = "no_terminal"
+    apply_link = approved or not link_writes
+    apply_codex = approved or not codex_writes
+
+    link_apply_command = f"mb skill link{_repo_flag(target_repo)}"
+    codex_apply_command = f"mb doctor repair{_repo_flag(target_repo)} --apply --only codex"
+
+    before = _tracked_snapshot(target_repo) if (apply_link or apply_codex) else None
+
+    if not apply_link:
+        surface["claude"] = {
+            "ok": True,
+            "applied": False,
+            "skill_count": 0,
+            "tracked_writes": link_writes,
+            "command": link_apply_command,
+            "plan": link_plan,
+        }
+        planned["apply_commands"].append(link_apply_command)
+    else:
+        linked_count, link_errors, link_warnings, link_payload = _link_skills(target_repo)
+        claude_command = f"mb skill link --repo {shlex.quote(str(target_repo))} --json"
+        result["actions"].append(f"ran `{claude_command}`")
+        surface["commands"].append(claude_command)
+        surface["claude"] = {
+            "ok": not link_errors,
+            "applied": True,
+            "skill_count": linked_count,
+            "command": claude_command,
+            "result": link_payload or {},
+        }
+        result["skills_relinked_count"] = linked_count
+        result["warnings"].extend(link_warnings)
+        if link_errors:
+            result["ok"] = False
+            result["errors"].extend(link_errors)
+            return
+
+    if not apply_codex:
+        surface["codex"] = {
+            "ok": True,
+            "applied": False,
+            "tracked_writes": codex_writes,
+            "command": codex_apply_command,
+            "plan": {
+                "actions": [
+                    {
+                        "id": str(action.get("id") or ""),
+                        "title": str(action.get("title") or ""),
+                        "writes": [str(path) for path in action.get("writes", [])],
+                    }
+                    for action in codex_plan.get("actions", [])
+                    if isinstance(action, dict)
+                ],
+            },
+        }
+        planned["apply_commands"].append(codex_apply_command)
+    else:
+        codex_ok, codex_errors, codex_warnings, codex_payload = _repair_codex_surface(target_repo)
+        codex_command = (
+            f"mb doctor repair --repo {shlex.quote(str(target_repo))} --apply --only codex --json"
+        )
+        result["actions"].append(f"ran `{codex_command}`")
+        surface["commands"].append(codex_command)
+        surface["codex"] = {
+            "ok": codex_ok,
+            "applied": True,
+            "command": codex_command,
+            "result": codex_payload or {},
+        }
+        result["codex_repaired"] = codex_ok
+        if codex_payload is not None:
+            result["codex_repair_result"] = codex_payload
+        result["warnings"].extend(codex_warnings)
+        if codex_errors:
+            result["ok"] = False
+            result["errors"].extend(codex_errors)
+
+    if before is not None:
+        after = _tracked_snapshot(target_repo)
+        unapproved = (
+            _unapproved_tracked_changes(before, after, tracked_files if approved else [])
+            if after is not None
+            else []
+        )
+        if unapproved:
+            result["ok"] = False
+            result["errors"].append(
+                "mb update changed tracked file(s) that were not approved: "
+                + ", ".join(unapproved)
+                + ". Nothing was reverted; review them with `git status` and `git diff`."
+            )
+            planned["unapproved_changes"] = unapproved
+
+    if planned["apply_commands"]:
+        template = (
+            SURFACE_PLAN_DECLINED_MESSAGE
+            if planned["consent"] == "declined"
+            else SURFACE_PLAN_NO_TERMINAL_MESSAGE
+        )
+        result["warnings"].append(template.format(files=", ".join(tracked_files)))
+        if not apply_codex:
+            # Review before apply: the plan names every file the repair writes.
+            result["next_actions"].append(
+                f"mb doctor repair{_repo_flag(target_repo)} --plan --only codex"
+            )
+        result["next_actions"].extend(planned["apply_commands"])
+
+
 def run(
     repo: str | Path = ".",
     *,
@@ -552,14 +893,21 @@ def run(
     refresh_surfaces: bool = True,
     interactive: bool | None = None,
     confirm: Callable[[str, Path | None], bool] | None = None,
+    confirm_surfaces: Callable[[Path, list[str]], bool] | None = None,
 ) -> dict[str, Any]:
     """Update the active Main Branch install and refresh business-repo skills.
 
     `pipx` and `clone` installs upgrade automatically. A `uv` tool install
     upgrades only after an explicit yes at an interactive prompt; every other
     path prints the working command instead of refusing (#963).
+
+    The surface refresh changes tracked files in the business repo (`AGENTS.md`,
+    `.gitignore`) only after one explicit yes at an interactive prompt. Without
+    one, it plans those changes into `surface_refresh.planned` and hands back
+    the apply commands as `next_actions` (#1012).
     """
     target_repo = Path(repo).resolve()
+    wants_prompt = _is_interactive_terminal() if interactive is None else interactive
     mode = _resolve_install_mode()
     root = engine_root()
     result = _base_result(
@@ -626,11 +974,16 @@ def run(
             )
         if refresh_surfaces:
             surface_commands = [
-                f"mb skill link --repo {target_repo} --json",
-                f"mb doctor repair --repo {target_repo} --apply --only codex --json",
+                f"mb skill link --repo {shlex.quote(str(target_repo))} --json",
+                f"mb doctor repair --repo {shlex.quote(str(target_repo))} "
+                "--apply --only codex --json",
             ]
             result["surface_refresh"]["commands"] = surface_commands
             result["actions"].extend(f"would run `{command}`" for command in surface_commands)
+            result["actions"].append(
+                "would ask once before changing tracked files (AGENTS.md, .gitignore); "
+                "without a terminal, would report the plan and leave them unchanged"
+            )
             planned_count = len(bundled_skills())
             result["skills_relinked_count"] = planned_count
             result["planned_skills_relink_count"] = planned_count
@@ -687,7 +1040,6 @@ def run(
             result["errors"].append("uv install mode detected, but `uv` is not on PATH")
             result["next_actions"].append(UV_UPDATE_COMMAND_TEXT)
             return result
-        wants_prompt = _is_interactive_terminal() if interactive is None else interactive
         approved = False
         if wants_prompt:
             approved = (confirm or _confirm_uv_update)(UV_UPDATE_COMMAND_TEXT, root)
@@ -733,45 +1085,27 @@ def run(
         result["upgrade_performed"] = True
 
     if refresh_surfaces:
-        linked_count, link_errors, link_warnings, link_payload = _link_skills(target_repo)
-        claude_command = f"mb skill link --repo {target_repo} --json"
-        result["actions"].append(f"ran `{claude_command}`")
-        result["surface_refresh"]["commands"].append(claude_command)
-        result["surface_refresh"]["claude"] = {
-            "ok": not link_errors,
-            "skill_count": linked_count,
-            "command": claude_command,
-            "result": link_payload or {},
-        }
-        result["skills_relinked_count"] = linked_count
-        result["warnings"].extend(link_warnings)
-        if link_errors:
-            result["ok"] = False
-            result["errors"].extend(link_errors)
-        else:
-            codex_ok, codex_errors, codex_warnings, codex_payload = _repair_codex_surface(
-                target_repo
-            )
-            codex_command = f"mb doctor repair --repo {target_repo} --apply --only codex --json"
-            result["actions"].append(f"ran `{codex_command}`")
-            result["surface_refresh"]["commands"].append(codex_command)
-            result["surface_refresh"]["codex"] = {
-                "ok": codex_ok,
-                "command": codex_command,
-                "result": codex_payload or {},
-            }
-            result["codex_repaired"] = codex_ok
-            if codex_payload is not None:
-                result["codex_repair_result"] = codex_payload
-            result["warnings"].extend(codex_warnings)
-            if codex_errors:
-                result["ok"] = False
-                result["errors"].extend(codex_errors)
+        _refresh_surfaces(
+            result,
+            target_repo,
+            wants_prompt=wants_prompt,
+            confirm=confirm_surfaces or _confirm_surface_writes,
+        )
     else:
         result["actions"].append("skipped agent surface refresh")
     _add_codex_follow_up(result, target_repo)
     _add_plugin_follow_up(result, target_repo)
+    result["next_actions"] = list(dict.fromkeys(result["next_actions"]))
     return result
+
+
+def _render_surface_plan(result: dict[str, Any]) -> None:
+    surface = result.get("surface_refresh")
+    planned = surface.get("planned") if isinstance(surface, dict) else None
+    if not isinstance(planned, dict) or not planned.get("apply_commands"):
+        return
+    files = ", ".join(str(path) for path in planned.get("tracked_files", []))
+    print(f"left tracked files unchanged: {files}")
 
 
 def render_human(result: dict[str, Any]) -> None:
@@ -812,6 +1146,7 @@ def render_human(result: dict[str, Any]) -> None:
             print(f"refreshed {count} skill link(s)")
             if result.get("codex_repaired"):
                 print("refreshed Codex global skills")
+            _render_surface_plan(result)
         else:
             print("skipped agent surface refresh")
         for action in result.get("next_actions", []):
@@ -822,6 +1157,7 @@ def render_human(result: dict[str, Any]) -> None:
             print(f"refreshed {count} skill link(s)")
             if result.get("codex_repaired"):
                 print("refreshed Codex global skills")
+            _render_surface_plan(result)
         else:
             print("skipped agent surface refresh")
         for action in result.get("next_actions", []):
