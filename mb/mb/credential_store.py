@@ -323,7 +323,20 @@ class SecretStore:
             raise CredentialStoreError(_reason_for(self.backend, state))
 
 
-def list_keychain_refs(*, deadline: float | None = None) -> list[str]:
+class KeychainListing(NamedTuple):
+    """Main Branch refs found in the macOS Keychain (attributes only)."""
+
+    refs: list[str]
+    # False unless the helper proved the listing whole: `found` equal to the
+    # refs returned. A capped listing, or one from a helper that does not
+    # report `found` (another mb version), is incomplete.
+    complete: bool
+    # Refs the helper found in all, when it said; None when it did not.
+    found: int | None
+    limit: int = 0
+
+
+def list_keychain_refs(*, deadline: float | None = None) -> KeychainListing:
     """Every Main Branch ref in the macOS Keychain, staged copies included.
 
     The helper asks for item attributes only, never data, with keychain
@@ -339,7 +352,20 @@ def list_keychain_refs(*, deadline: float | None = None) -> list[str]:
     refs = result.get("refs")
     if not isinstance(refs, list) or not all(isinstance(ref, str) for ref in refs):
         raise CredentialStoreError(_reason_for(backend, "unavailable"))
-    return list(refs)
+
+    def count(key: str) -> int | None:
+        value = result.get(key)
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    found = count("found")
+    if found is not None and found < len(refs):
+        found = None
+    return KeychainListing(
+        list(refs),
+        complete=found == len(refs) and result.get("truncated") is not True,
+        found=found,
+        limit=count("limit") or 0,
+    )
 
 
 def _reason_for(backend: str, state: str) -> str:
@@ -415,6 +441,17 @@ def _run_helper(
     return result
 
 
+def _helper_cwd() -> str:
+    """The directory that holds this ``mb`` package.
+
+    ``python -m`` puts the working directory first on ``sys.path``. Starting
+    the helper here makes ``mb._credential_helper`` resolve to this package,
+    whatever directory the command was run from.
+    """
+
+    return str(Path(__file__).resolve().parent.parent)
+
+
 def _invoke_helper(args: list[str], stdin: str, timeout: float) -> tuple[int, str]:
     """Run the helper in its own process group; on timeout kill the whole group.
 
@@ -429,6 +466,7 @@ def _invoke_helper(args: list[str], stdin: str, timeout: float) -> tuple[int, st
         stderr=subprocess.DEVNULL,
         text=True,
         start_new_session=True,
+        cwd=_helper_cwd(),
     )
     try:
         stdout, _ = process.communicate(stdin, timeout=timeout)

@@ -28,7 +28,9 @@ ERR_SEC_INTERACTION_NOT_ALLOWED = -25308
 ERR_SEC_USER_CANCELED = -128
 KEYCHAIN_UNLOCKED_STATUS = 1
 CF_STRING_ENCODING_UTF8 = 0x08000100
-# `list` returns at most this many refs; more than this is not an mb install.
+# `list` returns at most this many refs (the output must stay well under the
+# parent's 1 MiB limit). Past it the result says `truncated`, so a repair can
+# never pass off a partial listing as the whole keychain.
 LIST_LIMIT = 2000
 # Test-only seam: point the macOS adapter at a throwaway keychain instead of
 # the user's default. Honored only for a file named ``mbtest-*.keychain-db``
@@ -110,12 +112,22 @@ def _emit(
     migrated: bool = False,
     owner: str = "",
     refs: list[str] | None = None,
+    found: int | None = None,
 ) -> int:
     payload: dict[str, Any] = {"state": state}
     if value is not None:
         payload["value"] = value
     if refs is not None:
         payload["refs"] = refs
+    if refs is not None:
+        # Every listing says how many refs it found and the cap, complete or
+        # not: the parent accepts a listing as complete only when `found`
+        # equals the refs it got, so a helper that predates this protocol can
+        # never pass off a capped listing as the whole keychain.
+        payload["found"] = found if found is not None else len(refs)
+        payload["limit"] = LIST_LIMIT
+        if payload["found"] > len(refs):
+            payload["truncated"] = True
     if migrated:
         payload["migrated"] = True
     if owner:
@@ -613,20 +625,22 @@ class _MacSecurity:
             self.core.CFRelease(query)
             self.core.CFRelease(service)
 
-    def list_refs(self) -> tuple[str, list[str]]:
+    def list_refs(self) -> tuple[str, list[str], int]:
         """Every mb ref in the keychain, staged copies included, sorted.
 
         Refs that mb could not have written (see ``_SAFE_REF``) are left out.
+        At most ``LIST_LIMIT`` refs are returned, with the number found, so a
+        caller can tell a cut listing from a complete one.
         """
 
         health = self.health()
         if health != "ready":
-            return health, []
+            return health, [], 0
         state, accounts = self._ctypes_accounts()
         if state != "ready":
-            return _denied_state_for(state, health=health), []
+            return _denied_state_for(state, health=health), [], 0
         refs = sorted({account for account in accounts if _SAFE_REF.fullmatch(account)})
-        return "ready", refs[:LIST_LIMIT]
+        return "ready", refs[:LIST_LIMIT], len(refs)
 
     # -- Items created by Apple-signed /usr/bin/security ---------------------
 
@@ -1049,11 +1063,11 @@ def _macos(action: str, payload: dict[str, Any]) -> tuple[str, str | None, bool,
     return "unavailable", None, False, ""
 
 
-def _macos_list(payload: dict[str, Any]) -> tuple[str, list[str]]:
+def _macos_list(payload: dict[str, Any]) -> tuple[str, list[str], int]:
     """List mb's keychain refs. Always with interaction off, whatever the payload says."""
 
     if platform.system() != "Darwin":
-        return "unavailable", []
+        return "unavailable", [], 0
     deadline = payload.get("deadline_epoch")
     adapter = _MacSecurity(
         interactive=False,
@@ -1167,10 +1181,12 @@ def main() -> int:
         migrated, owner = False, ""
         if action == "list":
             # Only the macOS Keychain can be enumerated without reading values.
-            state, refs = (
-                _macos_list(payload) if backend == "macos-keychain" else ("unavailable", [])
+            state, refs, found = (
+                _macos_list(payload) if backend == "macos-keychain" else ("unavailable", [], 0)
             )
-            return _emit(state, refs=refs if state == "ready" else None)
+            if state != "ready":
+                return _emit(state)
+            return _emit(state, refs=refs, found=found)
         if backend == "macos-keychain":
             state, value, migrated, owner = _macos(action, payload)
         elif backend == "secret-service":

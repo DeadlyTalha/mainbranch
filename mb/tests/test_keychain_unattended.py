@@ -608,13 +608,13 @@ def test_keychain_listing_is_never_interactive(monkeypatch: pytest.MonkeyPatch) 
         def __init__(self, *, interactive: bool = False, **kwargs: Any) -> None:
             seen.append(interactive)
 
-        def list_refs(self) -> tuple[str, list[str]]:
-            return "ready", []
+        def list_refs(self) -> tuple[str, list[str], int]:
+            return "ready", [], 0
 
     monkeypatch.setattr(platform, "system", lambda: "Darwin")
     monkeypatch.setattr(helper_mod, "_MacSecurity", Adapter)
 
-    assert helper_mod._macos_list({"interactive": True}) == ("ready", [])
+    assert helper_mod._macos_list({"interactive": True}) == ("ready", [], 0)
     assert seen == [False]
 
 
@@ -628,14 +628,65 @@ def test_keychain_listing_checks_the_lock_and_keeps_only_mb_refs() -> None:
         return "ready", ["mainbranch://b/x/y", "mainbranch://a/x/y", 'bad "ref', "a.mbstage"]
 
     adapter._ctypes_accounts = accounts
-    assert adapter.list_refs() == ("locked", [])
+    assert adapter.list_refs() == ("locked", [], 0)
     assert listed == []
 
     adapter.health = lambda: "ready"
     assert adapter.list_refs() == (
         "ready",
         ["a.mbstage", "mainbranch://a/x/y", "mainbranch://b/x/y"],
+        3,
     )
+
+
+def _listing_json(refs: list[str]) -> str:
+    """A complete ``list`` response in the current helper protocol."""
+
+    return json.dumps(
+        {"state": "ready", "refs": refs, "found": len(refs), "limit": helper_mod.LIST_LIMIT}
+    )
+
+
+def _fake_refs(count: int) -> list[str]:
+    return [f"mainbranch://{index:024x}/stripe/api_key" for index in range(count)]
+
+
+def test_keychain_listing_past_the_cap_says_it_was_cut(
+    monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    """2001 refs: the helper returns the first 2000 and says it found 2001 (P2 on #1013)."""
+
+    refs = _fake_refs(helper_mod.LIST_LIMIT + 1)
+
+    class Adapter:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        def health(self) -> str:
+            return "ready"
+
+        def _ctypes_accounts(self) -> tuple[str, list[str]]:
+            return "ready", list(reversed(refs))
+
+        list_refs = helper_mod._MacSecurity.list_refs
+
+    monkeypatch.setattr(platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(helper_mod, "_MacSecurity", Adapter)
+    monkeypatch.setattr(sys, "argv", ["helper", "macos-keychain", "list"])
+    monkeypatch.setattr(sys, "stdin", SimpleNamespace(read=lambda size: "{}"))
+
+    assert helper_mod.main() == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["refs"] == refs[: helper_mod.LIST_LIMIT]
+    assert (out["truncated"], out["limit"], out["found"]) == (True, 2000, 2001)
+    assert "value" not in out
+
+    # Exactly at the cap is complete, and still says what it found.
+    refs = _fake_refs(helper_mod.LIST_LIMIT)
+    assert helper_mod.main() == 0
+    out = json.loads(capsys.readouterr().out)
+    assert set(out) == {"state", "refs", "found", "limit"}
+    assert len(out["refs"]) == out["found"] == helper_mod.LIST_LIMIT
 
 
 def test_keychain_listing_is_macos_only(monkeypatch: pytest.MonkeyPatch, capsys: Any) -> None:
@@ -669,9 +720,7 @@ class _FakeKeychainHelper:
                 ref + helper_mod.STAGE_SUFFIX if kind == "staged" else ref
                 for ref, kind in self.items.items()
             )
-            return SimpleNamespace(
-                returncode=0, stdout=json.dumps({"state": "ready", "refs": refs})
-            )
+            return SimpleNamespace(returncode=0, stdout=_listing_json(refs))
         assert action == "get"
         ref: str = payload["ref"]
         assert not ref.endswith(helper_mod.STAGE_SUFFIX), "a staged copy is never read directly"
@@ -776,6 +825,213 @@ def test_keychain_repair_all_repairs_every_item_in_one_pass(
     assert "fixture" not in json.dumps(result)
 
 
+def test_keychain_repair_all_past_the_cap_is_never_a_clean_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from typer.testing import CliRunner
+
+    from mb import cli as cli_mod
+    from mb.cli import app
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    repo = _keychain_repo(tmp_path, monkeypatch)
+    refs = _fake_refs(helper_mod.LIST_LIMIT + 1)
+    helper = _FakeKeychainHelper(dict.fromkeys(refs[: helper_mod.LIST_LIMIT], "security"))
+    original = helper.run
+
+    def run(args: list[str], **kwargs: Any) -> SimpleNamespace:
+        if args[-1] != "list":
+            return original(args, **kwargs)
+        helper.calls.append({"action": "list", "payload": json.loads(kwargs["input"])})
+        listing = {
+            "state": "ready",
+            "refs": refs[: helper_mod.LIST_LIMIT],
+            "truncated": True,
+            "limit": helper_mod.LIST_LIMIT,
+            "found": len(refs),
+        }
+        return SimpleNamespace(returncode=0, stdout=json.dumps(listing))
+
+    monkeypatch.setattr(store_mod, "subprocess", _fake_subprocess(run))
+
+    result = connect_mod.repair_keychain_all(repo, interactive=True)
+
+    # Every listed item is fine, yet the pass is incomplete, not ok.
+    assert result["counts"] == {"ready": helper_mod.LIST_LIMIT}
+    assert result["pending"] == 0
+    assert result["ok"] is False
+    assert result["complete"] is False
+    assert (result["listed"], result["unlisted"], result["list_limit"]) == (2000, 1, 2000)
+    assert result["repair_command"] == "mb connect repair --keychain"
+
+    class _TerminalSys:
+        stdin = SimpleNamespace(isatty=lambda: True)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(sys, name)
+
+    monkeypatch.setattr(cli_mod, "sys", _TerminalSys())
+    cli = CliRunner().invoke(app, ["connect", "repair", "--keychain", "--all", "--repo", str(repo)])
+
+    assert cli.exit_code == 1
+    assert "incomplete:" in cli.stdout
+    assert "2000 listed, 1 not checked" in cli.stdout
+    assert "next: run `mb connect repair --keychain`" in cli.stdout
+
+
+def _repair_all_from_listing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, listing_stdout: str
+) -> tuple[dict[str, Any], Any]:
+    """Run ``repair_keychain_all`` and the CLI on one raw ``list`` response."""
+
+    from typer.testing import CliRunner
+
+    from mb import cli as cli_mod
+    from mb.cli import app
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    repo = _keychain_repo(tmp_path, monkeypatch)
+    listed = json.loads(listing_stdout)["refs"]
+    helper = _FakeKeychainHelper(dict.fromkeys(listed, "security"))
+    original = helper.run
+
+    def run(args: list[str], **kwargs: Any) -> SimpleNamespace:
+        if args[-1] == "list":
+            return SimpleNamespace(returncode=0, stdout=listing_stdout)
+        return original(args, **kwargs)
+
+    monkeypatch.setattr(store_mod, "subprocess", _fake_subprocess(run))
+    result = connect_mod.repair_keychain_all(repo, interactive=True)
+
+    class _TerminalSys:
+        stdin = SimpleNamespace(isatty=lambda: True)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(sys, name)
+
+    monkeypatch.setattr(cli_mod, "sys", _TerminalSys())
+    cli = CliRunner().invoke(app, ["connect", "repair", "--keychain", "--all", "--repo", str(repo)])
+    return result, cli
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {},  # a helper from before the protocol: no `found`, no `truncated`
+        {"found": True},
+        {"found": "2001"},
+        {"found": 3},  # fewer than it returned
+        {"truncated": True},
+        {"found": 5, "truncated": True},
+    ],
+    ids=["no-found", "bool-found", "str-found", "found-too-small", "flag-only", "flag-and-equal"],
+)
+def test_keychain_repair_all_accepts_only_a_proven_whole_listing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra: dict[str, Any]
+) -> None:
+    refs = _fake_refs(5)
+    stdout = json.dumps({"state": "ready", "refs": refs, **extra})
+
+    result, cli = _repair_all_from_listing(tmp_path, monkeypatch, stdout)
+
+    assert result["counts"] == {"ready": 5}
+    assert result["pending"] == 0
+    assert (result["ok"], result["complete"]) == (False, False)
+    assert result["repair_command"] == "mb connect repair --keychain"
+    assert cli.exit_code == 1
+    assert "incomplete:" in cli.stdout
+
+
+def _base_helper_module(tmp_path: Path) -> Any:
+    """The 3759fc4 helper (before the list protocol), loaded as its own module."""
+
+    import importlib.util
+
+    root = MB_PACKAGE.parent.parent
+    shown = subprocess.run(
+        ["git", "-C", str(root), "show", "3759fc4:mb/mb/_credential_helper.py"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if shown.returncode != 0:
+        pytest.skip("commit 3759fc4 is not in this checkout (shallow clone)")
+    path = tmp_path / "base_credential_helper.py"
+    path.write_text(shown.stdout, encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("base_credential_helper", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_keychain_repair_all_with_an_older_helper_past_its_cap_is_not_ok(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    """Mixed versions: the 3759fc4 helper caps 2001 refs at 2000 without saying so."""
+
+    base = _base_helper_module(tmp_path)
+    refs = _fake_refs(base.LIST_LIMIT + 1)
+
+    class Adapter:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        def health(self) -> str:
+            return "ready"
+
+        def _ctypes_accounts(self) -> tuple[str, list[str]]:
+            return "ready", refs
+
+        list_refs = base._MacSecurity.list_refs
+
+    monkeypatch.setattr(base.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(base, "_MacSecurity", Adapter)
+    monkeypatch.setattr(sys, "argv", ["helper", "macos-keychain", "list"])
+    monkeypatch.setattr(sys, "stdin", SimpleNamespace(read=lambda size: "{}"))
+    assert base.main() == 0
+    stdout = capsys.readouterr().out
+    assert set(json.loads(stdout)) == {"state", "refs"}  # the old protocol
+    assert len(json.loads(stdout)["refs"]) == 2000
+
+    result, cli = _repair_all_from_listing(tmp_path, monkeypatch, stdout)
+
+    assert result["counts"] == {"ready": 2000}
+    assert (result["ok"], result["complete"], result["unlisted"]) == (False, False, None)
+    assert cli.exit_code == 1
+    assert "did not say whether it is complete" in cli.stdout
+
+
+def test_a_full_listing_of_the_longest_refs_fits_the_output_limit(
+    monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    """2000 refs of the longest accepted shape still fit under HELPER_OUTPUT_LIMIT."""
+
+    longest = [f"{index:04d}" + "x" * 508 for index in range(helper_mod.LIST_LIMIT)]
+    assert all(helper_mod._SAFE_REF.fullmatch(ref) for ref in longest)
+    assert len(longest[0]) == 512
+
+    helper_mod._emit("ready", refs=longest, found=helper_mod.LIST_LIMIT + 1)
+    out = capsys.readouterr().out
+
+    assert len(out) < store_mod.HELPER_OUTPUT_LIMIT
+    assert json.loads(out)["truncated"] is True
+
+
+def test_keychain_repair_all_complete_listing_reports_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    repo = _keychain_repo(tmp_path, monkeypatch)
+    _FakeKeychainHelper({"mainbranch://abc/stripe/api_key": "security"}).install(monkeypatch)
+
+    result = connect_mod.repair_keychain_all(repo, interactive=True)
+
+    assert (result["ok"], result["complete"], result["unlisted"]) == (True, True, 0)
+    assert result["repair_command"] == ""
+
+
 def test_keychain_repair_all_skips_a_staged_copy_when_its_item_exists(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -788,9 +1044,7 @@ def test_keychain_repair_all_skips_a_staged_copy_when_its_item_exists(
     def run(args: list[str], **kwargs: Any) -> SimpleNamespace:
         if args[-1] == "list":
             refs = [ref, ref + helper_mod.STAGE_SUFFIX]
-            return SimpleNamespace(
-                returncode=0, stdout=json.dumps({"state": "ready", "refs": refs})
-            )
+            return SimpleNamespace(returncode=0, stdout=_listing_json(refs))
         return original(args, **kwargs)
 
     monkeypatch.setattr(store_mod, "subprocess", _fake_subprocess(run))
@@ -2141,9 +2395,10 @@ def test_macos_listing_every_item_is_prompt_free(tmp_path: Path, throwaway_keych
         listed = _helper([sys.executable], "list", payload)
         assert listed["state"] == "ready"
         assert listed["refs"] == sorted([foreign, own])
-        assert set(listed) == {"state", "refs", "elapsed"}
+        assert set(listed) == {"state", "refs", "found", "limit", "elapsed"}
+        assert listed["found"] == 2
         assert listed["elapsed"] < 2.0
-    assert store_mod.list_keychain_refs() == sorted([foreign, own])
+    assert store_mod.list_keychain_refs().refs == sorted([foreign, own])
 
 
 @integration
@@ -2172,8 +2427,8 @@ def test_macos_repair_all_moves_legacy_items_and_recovers_staged_ones(
         check=False,
     )
     assert crashed.returncode == 70
-    assert staged + helper_mod.STAGE_SUFFIX in store_mod.list_keychain_refs()
-    assert staged not in store_mod.list_keychain_refs()
+    assert staged + helper_mod.STAGE_SUFFIX in store_mod.list_keychain_refs().refs
+    assert staged not in store_mod.list_keychain_refs().refs
 
     # Unattended only: the foreign item would need a dialog, which a test never shows.
     result = connect_mod.repair_keychain_all(tmp_path, interactive=False)
@@ -2191,4 +2446,50 @@ def test_macos_repair_all_moves_legacy_items_and_recovers_staged_ones(
     for ref in (legacy, staged, owned):
         assert adapter._item_owner(ref) == "security"
     assert adapter._item_owner(staged + helper_mod.STAGE_SUFFIX) == "absent"
-    assert store_mod.list_keychain_refs() == sorted([legacy, staged, foreign, owned])
+    assert store_mod.list_keychain_refs().refs == sorted([legacy, staged, foreign, owned])
+
+
+def test_the_helper_starts_from_the_installed_package_directory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[dict[str, Any]] = []
+
+    def run(args: list[str], **kwargs: Any) -> SimpleNamespace:
+        return SimpleNamespace(returncode=1, stdout='{"state":"unavailable"}')
+
+    fake = _fake_subprocess(run)
+
+    class RecordingPopen(fake.Popen):  # type: ignore[misc,name-defined]
+        def __init__(self, args: list[str], **kwargs: Any) -> None:
+            seen.append(kwargs)
+            super().__init__(args, **kwargs)
+
+    fake.Popen = RecordingPopen
+    monkeypatch.setattr(store_mod, "subprocess", fake)
+
+    store_mod._run_helper("no-such-backend", "get", ref="fixture-ref")
+
+    assert [call["cwd"] for call in seen] == [str(MB_PACKAGE.parent)]
+    assert (Path(seen[0]["cwd"]) / "mb" / "_credential_helper.py").is_file()
+
+
+def test_the_working_directory_cannot_stand_in_for_the_helper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A directory holding another ``mb`` package is ignored when the helper starts."""
+
+    other = tmp_path / "checkout"
+    (other / "mb").mkdir(parents=True)
+    (other / "mb" / "__init__.py").write_text("", encoding="utf-8")
+    (other / "mb" / "_credential_helper.py").write_text(
+        'import sys\nsys.stdout.write(\'{"state":"ready","value":"NOT-THE-HELPER"}\')\n',
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(other)
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+
+    # An unknown backend: the real helper answers at once and touches no keychain.
+    result = store_mod._run_helper("no-such-backend", "get", ref="fixture-ref")
+
+    assert result.get("value") != "NOT-THE-HELPER"
+    assert result == {"state": "unavailable"}
