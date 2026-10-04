@@ -354,26 +354,79 @@ logged-in user's GUI launchd domain; Main Branch does not install a daemon,
 broker, or launchd job. A new security session or reboot can require another
 interactive unlock in that owning session.
 
-Keychain item access control is separate from Keychain lock state. A new item
-trusts the installed Python application identity that created it, so after the
-Python under `mb` changes (a uv Python upgrade or reinstall), macOS wants to
-ask once more before that item can be read. Main Branch never waits on that
-dialog: every command reads with keychain interaction turned off, so a pending
-prompt fails at once with the `keychain_prompt_pending` state instead of
-running into the safety deadline. A locked keychain fails at once with
-`keychain_locked`, since unlocking would also need a dialog.
+Keychain item access control is separate from Keychain lock state. A macOS
+Keychain item trusts the program that created it. Main Branch reads and writes
+its items through Apple-signed `/usr/bin/security`, whose identity stays the
+same across Python, uv, `mb` and macOS updates, so changing the Python under
+`mb` does not bring back an access dialog. Values reach `security` only on
+stdin, hex-encoded (`security -i`), never in process arguments; a value too
+long for one `security -i` line is written as an empty item by `security` and
+filled in through the Security framework, which keeps the same access list.
 
-To answer the prompts, run this once from a terminal in the hub, at the screen,
-and choose **Always Allow** (Allow lets only that one read through):
+Items stored by `mb` before this change trust the Python that created them.
+The first read that this Python can do moves the item to `security` as a staged
+move, so no step can lose the credential:
+
+1. the full value is written to a temporary `security` item next to the old one
+   and read back;
+2. the old item is removed;
+3. the final `security` item is written and read back;
+4. the temporary item is removed.
+
+If a step fails, the old item is put back and the temporary copy is kept. If
+the process is killed between steps, the next access of that credential, in
+any command, finishes or undoes the move from the temporary copy before doing
+anything else. A move starts only when at least 3 seconds remain before the
+command's deadline; otherwise the read returns the value without moving it,
+and the next read moves it. This happens silently in any command, including
+unattended ones, with keychain interaction off.
+
+Unattended reads do not wait on a keychain dialog. Every command reads with
+keychain interaction turned off, so an item this Python is not trusted to read
+fails at once with the `keychain_prompt_pending` state instead of running into
+the safety deadline. A locked keychain fails at once with `keychain_locked`,
+since unlocking would also need a dialog. Main Branch runs `security` only on
+items whose access list already trusts it, because `security` itself cannot be
+told to fail instead of showing a dialog. An item whose access list was edited
+by hand can still make `security` raise a dialog; the command's deadline stops
+it, kills `security`, and reports `keychain_prompt_pending`.
+
+`ready` in `mb connect status` means the credential can be read now; it does
+not prove the item has moved to `security`. An item still owned by the old
+Python reads as `ready` until a Python change, then as
+`keychain_prompt_pending`. `mb connect repair --keychain` is the check that
+reports whether each item has moved.
+
+When an item reports `keychain_prompt_pending`, run this once from a terminal
+in the hub, at the screen, and choose **Always Allow** for each dialog (Allow lets only that one read
+through):
 
 ```bash
 mb connect repair --keychain
 ```
 
 It is the only command that lets macOS show the keychain dialog. It refuses to
-run without a terminal, waits up to 60 seconds per credential, and never prints
-a value. It reports a credential as repaired only after a fresh unattended read
-succeeds; otherwise it says the prompt is still pending. Never reset or delete the login keychain to repair one item.
+run without a terminal, waits up to 60 seconds per credential, moves each
+credential it can read to `security`, and never prints a value. It reports a
+credential as `repaired` only after a fresh unattended read succeeds and shows
+the item owned by `security`. A credential it can read but could not move
+reports `readable_not_migrated`: it works now but would ask again after a
+Python change, so run the command again. Otherwise it says the prompt is still
+pending. A credential already owned by `security` reports `ready`. After every
+credential reports `ready` or `repaired`, Python and `mb` updates do not ask
+again. Never reset or delete the login keychain to repair one item.
+
+To move an existing install, in this order, from a terminal in the hub:
+
+1. `mb update`. It runs `uv tool install mainbranch@latest`, which keeps the
+   Python the tool already uses; `uv tool list --show-python` shows it before
+   and after. Do not upgrade or reinstall uv's Python until step 3 reports
+   nothing pending: a new Python cannot read items that have not moved yet.
+2. `mb connect status`. Every credential this Python can read moves to
+   `security` silently; the rest report `keychain_prompt_pending`.
+3. `mb connect repair --keychain`, at the screen, choosing **Always Allow** for
+   each dialog. Run it again until every credential reports `ready` (already
+   owned by `security`) or `repaired`, and nothing is pending.
 
 On Linux, Main Branch uses the existing Secret Service default collection. It
 checks collection and item lock state and never calls an unlock method. Unlock
@@ -381,11 +434,14 @@ the collection in the user's desktop keyring application before starting the
 unattended reader.
 
 A connect attempt that fails on the backend stores nothing and leaves repo
-metadata unchanged. Replacement updates an existing Keychain item in place,
-and Secret Service updates a matched item in place while preserving its
-attributes, including legacy Python keyring attributes. New Secret Service
-items use its replacement contract. Main Branch never delete-before-adds an
-existing credential. Helper stderr and raw exceptions are discarded.
+metadata unchanged. Replacement updates an existing Keychain item in place; an
+item stored before the `security` change is updated in place first and then
+moved with the staged move above, which keeps a verified copy until the final
+item reads back. New Keychain items are written through the same staged move,
+so a failed write never leaves an empty credential. Secret Service updates a
+matched item in place while preserving its attributes, including legacy Python
+keyring attributes. New Secret Service items use its replacement contract.
+Helper stderr and raw exceptions are discarded.
 
 Reconnecting an already configured custom provider also works without
 `--custom`, but keeping the flag in repair output makes the command safe to

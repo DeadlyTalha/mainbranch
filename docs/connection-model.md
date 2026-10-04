@@ -43,6 +43,14 @@ APIs, and niche SaaS tools before Main Branch has native wrappers.
   `repo_id`-indexed; rotation now preserves the same boundary.
 - A desktop-unlocked macOS Keychain did not imply that an already-running
   remote security session was unlocked.
+- macOS Keychain items trusted the exact Python that created them. uv's Python
+  builds are unsigned, so every Python change brought back an access dialog
+  that unattended reads waited on until the safety deadline. Credentials now
+  live in items owned by Apple-signed `/usr/bin/security`, existing items move
+  there on their first successful read through a staged copy that is never
+  removed before the final item reads back, and unattended reads fail fast
+  with `keychain_prompt_pending` instead of waiting on a dialog. A hand-edited
+  item access list can still raise a dialog; the command deadline bounds it.
 - `ready` was reported for providers that were never called, so it meant "a
   credential is stored" rather than "this credential works". Storage and
   verification are now separate facts.

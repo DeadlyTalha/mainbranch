@@ -2056,13 +2056,14 @@ def hydrate(
 
 
 def repair_keychain(repo: str | Path = ".", *, interactive: bool = False) -> dict[str, Any]:
-    """Let a person at a terminal answer the macOS keychain dialog for each credential.
+    """Move every macOS Keychain credential of this repo to ``/usr/bin/security``.
 
     Every other command reads with keychain interaction disabled, so an item
     this mb install is not yet trusted to read reports
     ``keychain_prompt_pending`` instead of waiting on a dialog. This is the one
     place that dialog may appear, and only when the caller passes
-    ``interactive=True`` from a real terminal. Values are never returned.
+    ``interactive=True`` from a real terminal. Each successful read migrates
+    the item, so it is asked about at most once. Values are never returned.
     """
 
     target = Path(repo).resolve()
@@ -2079,7 +2080,7 @@ def repair_keychain(repo: str | Path = ".", *, interactive: bool = False) -> dic
     entries.update(
         {str(key): value for key, value in config["providers"].items() if isinstance(value, dict)}
     )
-    items: list[dict[str, str]] = []
+    items: list[dict[str, Any]] = []
     for provider_id in sorted(entries):
         raw_secrets = entries[provider_id].get("secrets")
         secrets = raw_secrets if isinstance(raw_secrets, dict) else {}
@@ -2094,16 +2095,30 @@ def repair_keychain(repo: str | Path = ".", *, interactive: bool = False) -> dic
                 continue
             if selected != "macos-keychain" or not ref:
                 continue
+            # A read that succeeds also moves a legacy item to the Apple-signed
+            # `security` tool, after which no Python change prompts again.
             probe = _probe_secret_ref(backend, ref)
             before = probe.reason or ("ready" if probe.present else "missing")
             state = before
+            migrated = probe.migrated
+            if probe.present and probe.owner != "security":
+                # Readable, but by this Python only: the next Python change
+                # would prompt again. Not a repair until `security` owns it.
+                state = "readable_not_migrated"
             if probe.reason == "keychain_prompt_pending" and interactive:
                 answered = _probe_secret_ref(backend, ref, interactive=True)
                 if answered.present:
-                    # "Allow" (once) lets this read through but leaves the item
-                    # untrusted. Only a fresh unattended read proves the repair.
+                    # The answered read also moves the item when this Python
+                    # may remove it. Only a fresh unattended read that finds the
+                    # item owned by `security` proves the repair.
                     after = _probe_secret_ref(backend, ref)
-                    state = "repaired" if after.present else "still_pending"
+                    migrated = answered.migrated or after.migrated
+                    if not after.present:
+                        state = "still_pending"
+                    elif after.owner == "security":
+                        state = "repaired"
+                    else:
+                        state = "readable_not_migrated"
                 else:
                     state = answered.reason or "missing"
             items.append(
@@ -2112,11 +2127,14 @@ def repair_keychain(repo: str | Path = ".", *, interactive: bool = False) -> dic
                     "field": field,
                     "before": before,
                     "state": state,
-                    "summary": _keychain_repair_summary(state),
+                    "migrated": migrated,
+                    "summary": _keychain_repair_summary(state, migrated=migrated),
                 }
             )
     pending = [
-        item for item in items if item["state"] in {"keychain_prompt_pending", "still_pending"}
+        item
+        for item in items
+        if item["state"] in {"keychain_prompt_pending", "still_pending", "readable_not_migrated"}
     ]
     failed = [item for item in items if item["state"] not in {"ready", "repaired", "missing"}]
     return {
@@ -2130,11 +2148,20 @@ def repair_keychain(repo: str | Path = ".", *, interactive: bool = False) -> dic
     }
 
 
-def _keychain_repair_summary(state: str) -> str:
+def _keychain_repair_summary(state: str, *, migrated: bool = False) -> str:
+    moved = "moved to the macOS security tool; Python changes no longer prompt"
     if state == "ready":
-        return "readable without a prompt"
+        return (
+            moved if migrated else "owned by the macOS security tool; Python changes do not prompt"
+        )
     if state == "repaired":
-        return "allowed; unattended reads now work"
+        return f"allowed and {moved}"
+    if state == "readable_not_migrated":
+        return (
+            "readable by this Python only; the move to the macOS security tool did not "
+            f"finish, so a Python change would prompt again: run `{KEYCHAIN_REPAIR_COMMAND}` "
+            "again"
+        )
     if state == "still_pending":
         return (
             "read once, but unattended reads still need a prompt: choose Always Allow "
