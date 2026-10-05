@@ -1553,17 +1553,16 @@ def connect_provider(
                     if isinstance(raw_secret, dict)
                 }
             else:
+                # A tokenless first connect records metadata and source only.
+                # No ref points at an item that was never written, and the
+                # entry is not connected until a secret is stored (#991).
                 store = SecretStore(secret_backend)
-                secrets[primary] = {
-                    "ref": _secret_ref(repo_id, provider.id, primary),
-                    "backend": store.backend,
-                }
     else:
         store = SecretStore(secret_backend)
 
     providers[provider.id] = {
         "provider": provider.id,
-        "connected": True,
+        "connected": bool(secrets) or not required,
         "scope": normalized_scope,
         "account_label": account_label.strip(),
         "connected_at": _now(),
@@ -1628,13 +1627,33 @@ def _secret_statuses(
         if not probe.present:
             missing.append(field)
         secrets[field] = {
-            "present": probe.present,
+            "present": _present_value(probe),
+            "presence": _secret_presence(probe),
             "ref": ref,
             "backend": backend,
             "backend_ok": probe.backend_ok,
             "backend_state": probe.reason or "ready",
         }
     return secrets, missing
+
+
+def _secret_presence(probe: SecretProbe) -> str:
+    """``present``, ``absent``, or ``unknown`` when the backend could not answer."""
+
+    if not probe.backend_ok:
+        return "unknown"
+    return "present" if probe.present else "absent"
+
+
+def _present_value(probe: SecretProbe) -> bool | None:
+    """``present`` is only ever false for a credential known to be absent.
+
+    A locked or unavailable backend cannot say whether the credential exists,
+    so it reads ``None`` rather than a ``False`` that looks like a missing
+    secret (#976). ``presence`` carries the same fact as a string.
+    """
+
+    return probe.present if probe.backend_ok else None
 
 
 def _probe_secret_ref(
@@ -1692,7 +1711,8 @@ def _unhydrated_status(
     return {
         "provider": provider.id,
         "name": provider.name,
-        "connected": True,
+        "connected": bool(entry.get("connected", True)),
+        "configured": True,
         "ok": ok,
         "state": state,
         "stored": bool(provider.required_secrets) and not missing and not backend_reason,
@@ -1834,6 +1854,7 @@ def status_provider(
             "provider": provider.id,
             "name": provider.name,
             "connected": bool(isinstance(entry, dict) and raw_entry.get("connected", False)),
+            "configured": isinstance(entry, dict),
             "ok": ok,
             "state": state,
             "stored": meta_stored,
@@ -1848,7 +1869,8 @@ def status_provider(
             "metadata": _safe_status_metadata(meta_metadata),
             "secrets": {
                 "access_token": {
-                    "present": secret_present,
+                    "present": _present_value(probe),
+                    "presence": _secret_presence(probe),
                     "ref": ref,
                     "backend": backend,
                     "backend_ok": probe.backend_ok,
@@ -1880,6 +1902,7 @@ def status_provider(
             "provider": provider.id,
             "name": provider.name,
             "connected": False,
+            "configured": False,
             "ok": False,
             "state": "not_connected",
             "stored": False,
@@ -1952,6 +1975,7 @@ def status_provider(
         "provider": provider.id,
         "name": provider.name,
         "connected": bool(entry.get("connected", False)),
+        "configured": True,
         "ok": ok,
         "state": state,
         "stored": stored,
@@ -3632,7 +3656,9 @@ def status_all(
     )
     for provider_id in custom_ids:
         providers.append(status_provider(provider_id, target, _credential_deadline=deadline))
-    connected = [item for item in providers if item["connected"]]
+    # Every recorded entry counts, including one connected without a token
+    # yet (#991): it is configured and reports `missing_secret` to act on.
+    connected = [item for item in providers if item.get("configured", item["connected"])]
     unverified = [item for item in connected if item["state"] == UNVERIFIED_STATE]
     # A stored-but-unverified provider is not broken: nothing is known to be
     # wrong with it and no repair command would change that. Counting it
@@ -3648,6 +3674,7 @@ def status_all(
         "user_scope_path": str(_user_scope_path()),
         "providers": providers,
         "github": github or github_context(target),
+        "credential_backend": _status_backend_health(providers, deadline=deadline),
         "safe_to_share": True,
         "summary": {
             "configured": len(connected),
@@ -3966,11 +3993,13 @@ def doctor_check(repo: str | Path = ".", *, status: dict[str, Any] | None = None
     }
 
 
-def credential_backend_health(backend: str | None = None) -> dict[str, Any]:
+def credential_backend_health(
+    backend: str | None = None, *, deadline: float | None = None
+) -> dict[str, Any]:
     """Read-only health probe of the local credential backend."""
 
     try:
-        return SecretStore(backend).health()
+        return SecretStore(backend).health(deadline=deadline)
     except (CredentialStoreError, ValueError) as exc:
         reason = exc.reason if isinstance(exc, CredentialStoreError) else "backend_incompatible"
         detail = _backend_repair(reason)
@@ -3996,7 +4025,9 @@ def _configured_credential_backends(status: dict[str, Any]) -> list[str]:
         for raw_secret in secrets.values():
             secret = raw_secret if isinstance(raw_secret, dict) else {}
             backend = str(secret.get("backend") or "")
-            if backend:
+            # A slot with no ref (a tokenless first connect, #991) never asked
+            # its backend anything, so it cannot vouch for that backend's health.
+            if backend and secret.get("ref"):
                 backends.add(backend)
     return sorted(backends)
 
@@ -4040,6 +4071,23 @@ def _configured_backend_health(status: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def _status_backend_health(
+    providers: list[dict[str, Any]], *, deadline: float | None = None
+) -> dict[str, Any]:
+    """Credential-backend health for `mb connect status`, with or without providers.
+
+    Reuses the per-provider probes when a recorded secret names a backend, so
+    the backend is not asked twice. Otherwise it probes the backend a new
+    connect would use, so a fresh repo can still see a locked or missing
+    store before the first `mb connect` fails on it (#976).
+    """
+
+    health = _configured_backend_health({"providers": providers})
+    if health is None:
+        health = credential_backend_health(deadline=deadline)
+    return health
+
+
 def _probe_gap(status: dict[str, Any]) -> dict[str, Any]:
     """Connected providers Main Branch has no way to verify.
 
@@ -4050,7 +4098,9 @@ def _probe_gap(status: dict[str, Any]) -> dict[str, Any]:
     providers = sorted(
         str(item.get("provider") or "")
         for item in status.get("providers") or []
-        if item.get("connected") and item.get("secrets") and not item.get("has_probe")
+        if item.get("configured", item.get("connected"))
+        and item.get("secrets")
+        and not item.get("has_probe")
     )
     if not providers:
         return {"providers": [], "summary": "", "safe_to_share": True}
@@ -4381,7 +4431,9 @@ def business_identity(repo: str | Path = ".") -> dict[str, Any]:
     pmap = provider_map()
     providers_out: list[dict[str, Any]] = []
     for item in status["providers"]:
-        if not item["connected"]:
+        # Configured, not only connected: a metadata-only first connect (#991)
+        # records identity fields before any secret is stored.
+        if not item.get("configured", item["connected"]):
             continue
         provider = pmap.get(item["provider"])
         metadata = item.get("metadata") or {}
