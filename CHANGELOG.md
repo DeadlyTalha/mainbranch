@@ -11,6 +11,21 @@ PyPI distribution `mainbranch` tracks the same version sequence.
 
 ## [Unreleased]
 
+### Fixed
+
+- `mainbranch` now requires `pyyaml>=6.0.1`. PyYAML 6.0 does not build on
+  Python 3.12, and the minimum-dependency CI job now also runs on 3.12 so a
+  floor like that fails the PR (#1028).
+- The update notice in `mb status` and `mb doctor` orders pre-releases the way
+  `mb update` and the installers do, so a `0.6.3rc1` install sees `0.6.3` as
+  newer, and a PyPI answer that is not a version counts as unknown instead of
+  current. The install repair in `mb status` readiness names the command for
+  the detected install mode instead of always pipx, and the pipx recovery
+  command reuses the run's one PyPI lookup (#1028).
+- No test assert reads straight out of `os.environ` or a captured environment
+  any more, so a failing test prints only the checked value, never the whole
+  environment; a guard test keeps the pattern out (#1025).
+
 ## [0.6.3] - 2026-10-05
 
 This patch makes `mb connect` and `mb update` report what is actually true.
